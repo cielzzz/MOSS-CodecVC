@@ -1,5 +1,7 @@
 # MOSS-CodecVC
 
+[English](README.md) | [简体中文](README_zh.md)
+
 MOSS-CodecVC 是一个基于 MOSS-TTS / MOSS-Audio-Tokenizer 的 codec-native voice conversion 框架骨架。
 
 目标任务不是普通 TTS，而是：
@@ -8,12 +10,10 @@ MOSS-CodecVC 是一个基于 MOSS-TTS / MOSS-Audio-Tokenizer 的 codec-native vo
 source wav 的内容/停顿/时长/节奏 + timbre reference wav 的音色 -> target wav
 ```
 
-## 模型图
+## 架构说明
 
-- [MOSS-VC / MOSS-CodecVC 模型结构图](docs/moss_codecvc_model_diagram.md)
-- [SVG 原图](docs/assets/moss_codecvc_model_diagram.svg)
-- [Ver1/Ver2/Ver3/Ver4 版本规划与消融设计](docs/versions_and_ablation.md)
-- [Ver2 大规模 LoRA 训练策略](docs/ver2_large_scale_training_strategy.md)
+公开仓库保留可运行源码、配置、小示例和实验入口脚本。更长的设计说明、模型图和内部实验记录位于本地
+`docs/` 目录；为了保持 GitHub 仓库轻量，该目录不会随公开版本上传。
 
 第一版先复用现有 `MOSS-TTS/moss_tts_delay/finetuning/sft.py` 做 teacher-forcing SFT：
 
