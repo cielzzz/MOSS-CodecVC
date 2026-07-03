@@ -1,0 +1,77 @@
+experiment:
+  id: formal_lora_zh1000_en1000
+  date: "2026-06-16"
+  owner: xyzhang
+  objective: >
+    First formal bilingual MOSS-CodecVC LoRA baseline with balanced zh/en data.
+
+environment:
+  python: /inspire/ssd/project/embodied-multimodality/public/xyzhang/anaconda3/envs/moss-vc/bin/python
+  config: configs/remote_full.yaml
+  model_path: /inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/vcdata_construction/MOSS-TTS
+  gpu: "single 4090, recommended CUDA_VISIBLE_DEVICES=0 or 1"
+
+dataset:
+  target_formal:
+    path: experiments/2026-06-16_formal_lora_zh1000_en1000/data/train_target_zh1000_en1000.jsonl
+    rows_total: 2000
+    language_breakdown:
+      zh: 1000
+      en: 1000
+    status: pending_data
+  current_warmup:
+    path: experiments/2026-06-16_formal_lora_zh1000_en1000/data/train_current_balanced_zh500_en500.jsonl
+    rows_total: 1000
+    language_breakdown:
+      zh: 500
+      en: 500
+    status: ready
+
+training_shared:
+  n_vq: 32
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-4
+  mixed_precision: bf16
+  attn_implementation: auto
+  num_workers: 0
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lm_heads_mode: none
+  trainable_lora_modules: all
+  logging_steps: 1
+  save_steps: 100
+  gradient_checkpointing: true
+
+runs:
+  warmup_available_1000:
+    output_dir: outputs/lora_runs/formal_lora_zh1000_en1000_warmup
+    train_jsonl: experiments/2026-06-16_formal_lora_zh1000_en1000/data/train_current_balanced_zh500_en500.jsonl
+    max_train_steps: 600
+    estimated_steps_per_epoch: 125
+    estimated_epochs: 4.8
+  formal_target_2000:
+    output_dir: outputs/lora_runs/formal_lora_zh1000_en1000_formal
+    train_jsonl: experiments/2026-06-16_formal_lora_zh1000_en1000/data/train_target_zh1000_en1000.jsonl
+    max_train_steps: 1000
+    estimated_steps_per_epoch: 250
+    estimated_epochs: 4.0
+
+metrics:
+  tensorboard_scalars:
+    - train/loss
+    - train/lr
+    - train/lora_grad_norm
+  offline_checks:
+    - target speaker similarity
+    - source speaker leakage
+    - duration ratio
+    - pause preservation
+    - zh intelligibility
+    - en intelligibility
+
+notes:
+  - Do not fabricate zh1000/en1000 by duplicating rows.
+  - Start with warmup_available_1000 immediately.
+  - Switch to formal_target_2000 only after true additional data is prepared.

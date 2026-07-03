@@ -1,0 +1,59 @@
+# Local/private project material
+.codex/
+codex/
+docs/
+
+# Conda and virtual environments
+.conda/
+conda/
+.venv/
+venv/
+env/
+
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Large datasets and generated artifacts
+trainset/
+testset/
+outputs/
+logs/
+tmp/
+cache/
+checkpoints/
+experiments/**/data/
+wandb/
+tensorboard/
+
+# Model weights, media, and bulky data files
+models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.npy
+*.npz
+*.wav
+*.flac
+*.mp3
+*.jsonl
+!examples/*.jsonl
+
+# Archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+
+# Third-party clones here include downloaded weights and nested Git repos.
+external/

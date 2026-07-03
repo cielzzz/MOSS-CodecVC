@@ -1,0 +1,86 @@
+version:
+  id: ver2
+  name: role_disentangled_codec_routing
+  description: Add role-aware routing metadata and future model hooks for source/prosody vs target timbre.
+
+data:
+  needs_new_audio: false
+  needs_counterfactual_source: false
+  needs_speaker_embeddings: false
+
+objectives:
+  codec_ce: 1.0
+  role_routing: 0.1
+
+model_hooks:
+  role_embeddings: true
+  codebook_routing: learned_soft_gate
+  route_unit: rvq_codebook
+
+model:
+  use_timbre_memory: true
+  use_role_routing: true
+  target_head_routing: true
+  timbre_memory_tokens: 16
+  timbre_adapter_layers: last_4
+  timbre_encoder_type: conformer
+  timbre_encoder_layers: 2
+  prosody_memory_tokens: 8
+  source_prosody_encoder_type: conformer
+  source_prosody_encoder_layers: 2
+  speaker_embedding_dim: 192
+  content_embedding_dim: 0
+  content_ctc_vocab_size: 0
+  content_token_vocab_size: 0
+
+loss:
+  route_loss_weight: 0.01
+  target_speaker_similarity_weight: 0.05
+  source_speaker_suppression_weight: 0.05
+  speaker_loss_warmup_steps: 1000
+  speaker_loss_warmup_weight: 0.02
+  speaker_loss_margin: 0.10
+  prosody_loss_weight: 0.0
+  prosody_f0_weight: 1.0
+  prosody_voiced_weight: 0.5
+  prosody_energy_weight: 0.5
+  prosody_pause_weight: 1.0
+  prosody_duration_weight: 0.5
+  prosody_normalize_f0: true
+  prosody_normalize_energy: true
+  content_loss_weight: 0.0
+  content_positive: source
+  content_embedding_weight: 1.0
+  content_ctc_weight: 0.0
+  content_ctc_blank_id: 0
+  content_ctc_token_offset: 1
+  content_token_weight: 0.0
+  content_source_codec_weight: 0.0
+  content_source_codec_codebooks: "0,1,2,3"
+  semantic_loss_weight: 0.0
+
+content_loss:
+  enabled: false
+  ctc_weight: 0.0
+  vocab_type: text_tokenizer
+  blank_id: 0
+
+asr_filter:
+  enabled: false
+  zh_cer_threshold: 0.20
+  en_wer_threshold: 0.25
+  max_repeat_score: 0.30
+
+semantic_loss:
+  enabled: false
+  extractor: hubert_or_wavlm
+  mode: discrete
+  source: source
+  vocab_size: 0
+  feature_dim: 0
+  feature_loss_type: cosine
+
+notes:
+  - Uses the same paired audio as Ver1.
+  - Requires model-side implementation to make role_routing loss active.
+  - Without model-side hooks, this config only produces metadata-compatible SFT rows.

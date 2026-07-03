@@ -1,0 +1,158 @@
+project:
+  name: MOSS-CodecVC
+  root: /inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/MOSS-CodecVC
+
+moss:
+  root: /inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/MOSS-TTS
+  model_path: /inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/vcdata_construction/MOSS-TTS
+  codec_path: /inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/vcdata_construction/MOSS-Audio-Tokenizer
+  variant: moss_tts_delay
+  sample_rate: 24000
+  default_n_vq: 32
+
+data:
+  default_pair_type: MOSSCodecVC
+  source_audio_keys:
+    - source_audio
+    - prosody_ref_audio
+    - reference_audio
+    - audio
+    - wav
+    - path
+  source_text_keys:
+    - source_text
+    - prosody_ref_text
+    - reference_text
+    - text
+    - transcript
+    - target_text
+  timbre_audio_keys:
+    - timbre_ref_audio
+    - target_speaker_audio
+    - ref_audio
+    - voice_ref_audio
+  timbre_text_keys:
+    - timbre_ref_text
+    - target_speaker_text
+    - ref_text
+    - voice_ref_text
+  target_audio_keys:
+    - target_audio
+    - converted_audio
+    - teacher_audio
+  target_text_keys:
+    - target_text
+    - text
+    - source_text
+    - reference_text
+
+instruction:
+  default: "Voice conversion task. [S1] is the source speech carrying content, pauses, duration and prosody. [S2] is the target timbre reference. Generate the same content as S1 with S2 timbre while preserving S1 timing and prosody."
+  prosody_no_timbre: "Preserve S1 content, speaking rate, pauses, rhythm, stress and duration, but do not copy S1 timbre. Use S2 as the non-source timbre reference."
+  text_prosody: "Text-guided voice conversion task. Use the provided text as lexical content. Use S1 only as a prosody/style reference for rhythm, pauses, speaking rate, stress and duration hints. Use S2 as the target timbre reference. Do not copy S1 speaker identity or S1 words."
+  no_text: "No-text voice conversion task. Preserve S1 content, pauses, duration and prosody. Use S2 as the target timbre reference. Do not copy S1 speaker identity unless it is also S2."
+
+training:
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-5
+  num_epochs: 1
+  max_train_steps: 0
+  mixed_precision: bf16
+  attn_implementation: auto
+  n_vq: 32
+
+model:
+  use_timbre_memory: true
+  timbre_memory_tokens: 16
+  timbre_adapter_layers: last_4
+  timbre_adapter_heads: 8
+  timbre_adapter_dim: 256
+  timbre_adapter_dropout: 0.0
+  timbre_adapter_init_gate: -4.0
+  timbre_encoder_type: conformer
+  timbre_encoder_layers: 2
+  timbre_conformer_kernel_size: 7
+  timbre_speaker_conditioning: true
+  speaker_encoder_type: embedding_loader
+  speaker_encoder_path:
+  freeze_speaker_encoder: true
+  speaker_embedding_dim: 192
+  use_role_routing: false
+  target_head_routing: false
+  prosody_memory_tokens: 8
+  source_prosody_encoder_type: conformer
+  source_prosody_encoder_layers: 2
+  source_prosody_conv_kernel_size: 7
+  content_embedding_dim: 0
+  content_ctc_vocab_size: 0
+  content_token_vocab_size: 0
+
+loss:
+  target_speaker_similarity_weight: 0.05
+  source_speaker_suppression_weight: 0.05
+  speaker_loss_warmup_steps: 1000
+  speaker_loss_warmup_weight: 0.02
+  speaker_loss_margin: 0.1
+  route_loss_weight: 0.01
+  prosody_loss_weight: 0.0
+  prosody_f0_weight: 1.0
+  prosody_voiced_weight: 0.5
+  prosody_energy_weight: 0.5
+  prosody_pause_weight: 1.0
+  prosody_duration_weight: 0.5
+  prosody_normalize_f0: true
+  prosody_normalize_energy: true
+  content_loss_weight: 0.0
+  content_positive: source
+  content_embedding_weight: 1.0
+  content_ctc_weight: 0.0
+  content_ctc_blank_id: 0
+  content_ctc_token_offset: 1
+  content_token_weight: 0.0
+  content_source_codec_weight: 0.0
+  content_source_codec_codebooks: "0,1,2,3"
+  semantic_loss_weight: 0.0
+
+content_loss:
+  enabled: false
+  ctc_weight: 0.0
+  vocab_type: text_tokenizer
+  blank_id: 0
+
+asr_filter:
+  enabled: false
+  zh_cer_threshold: 0.20
+  en_wer_threshold: 0.25
+  max_repeat_score: 0.30
+
+semantic_loss:
+  enabled: false
+  extractor: hubert_or_wavlm
+  mode: discrete
+  source: source
+  vocab_size: 0
+  feature_dim: 0
+  feature_loss_type: cosine
+
+source_semantic_memory:
+  enabled: false
+  extractor: hubert
+  feature_type: continuous
+  input_dim: 768
+  selected_layers: "28,30,32,34,35"
+  no_text_gate: 1.0
+  text_gate: 0.0
+  allow_learned_text_gate: false
+  dropout: 0.1
+  init_gate: -2.0
+  position_scale: 0.0
+  monotonic_bias_strength: 0.0
+  monotonic_bias_width: 0.25
+
+inference:
+  max_new_tokens: 2048
+  temperature: 0.8
+  top_p: 0.9
+  top_k: 50
+  do_sample: true

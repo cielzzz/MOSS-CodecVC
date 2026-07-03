@@ -1,0 +1,29 @@
+version:
+  id: ver4
+  name: adversarial_speaker_suppression
+  description: Add speaker-adversarial and mutual-information style suppression of source timbre leakage.
+
+data:
+  needs_new_audio: true
+  needs_counterfactual_source: true
+  needs_speaker_embeddings: true
+  new_metadata_type: speaker_embedding_paths
+
+objectives:
+  codec_ce: 1.0
+  role_routing: 0.1
+  counterfactual_consistency: 0.2
+  target_speaker_similarity: 0.2
+  source_speaker_suppression: 0.1
+  adversarial_mi: 0.05
+
+model_hooks:
+  role_embeddings: true
+  codebook_routing: learned_soft_gate
+  counterfactual_group_loss: true
+  speaker_adversary: gradient_reversal
+
+notes:
+  - Builds on Ver3.
+  - Requires a speaker encoder or speaker embedding extractor.
+  - Without model-side adversarial head, this config only carries embedding metadata.

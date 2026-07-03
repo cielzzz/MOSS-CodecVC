@@ -1,0 +1,16 @@
+version:
+  id: ver1
+  name: baseline_sft
+  description: Baseline MOSS-CodecVC SFT using source and timbre references.
+
+data:
+  needs_new_audio: false
+  needs_counterfactual_source: false
+  needs_speaker_embeddings: false
+
+objectives:
+  codec_ce: 1.0
+
+notes:
+  - This is the current baseline.
+  - It relies on instruction text to bind S1 and S2 roles.

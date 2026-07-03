@@ -1,0 +1,21 @@
+version:
+  id: ver_all
+  name: full_stack_final
+  description: Final combined setting for comparison after Ver2/Ver3/Ver4 ablations are validated.
+
+data:
+  needs_new_audio: true
+  needs_counterfactual_source: true
+  needs_speaker_embeddings: true
+
+objectives:
+  codec_ce: 1.0
+  role_routing: 0.1
+  counterfactual_consistency: 0.2
+  target_speaker_similarity: 0.2
+  source_speaker_suppression: 0.1
+  adversarial_mi: 0.05
+
+notes:
+  - Same objective stack as Ver4.
+  - Keep this name for final tables so ablations remain easy to read.
