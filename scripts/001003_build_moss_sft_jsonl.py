@@ -31,6 +31,37 @@ def load_codes(path: str) -> list[list[int]]:
     return codes.tolist()
 
 
+def nested_get(row: dict[str, Any], key: str) -> Any | None:
+    value = row.get(key)
+    if value not in (None, ""):
+        return value
+    meta = row.get("moss_codecvc_meta")
+    if isinstance(meta, dict):
+        value = meta.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def normalize_content_text(text: Any) -> str:
+    out: list[str] = []
+    for ch in str(text or "").lower():
+        code = ord(ch)
+        if ch.isalnum() or 0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF:
+            out.append(ch)
+    return "".join(out)
+
+
+def is_v2_real_no_text_ref_content_leak(row: dict[str, Any]) -> bool:
+    pair_type = str(nested_get(row, "pair_type") or "")
+    marker = nested_get(row, "v2_real_target")
+    if "v2_real_target" not in pair_type and not marker:
+        return False
+    ref_text = normalize_content_text(nested_get(row, "timbre_ref_text"))
+    target_text = normalize_content_text(nested_get(row, "target_text"))
+    return bool(ref_text and target_text and ref_text == target_text)
+
+
 def build_instruction(row: dict[str, Any], *, vc_mode: str, enable_mode_token: bool) -> str:
     if vc_mode == VC_MODE_TEXT:
         base = row.get("text_prosody_instruction") or (
@@ -147,7 +178,7 @@ def build_sft_row(
     sample_id = row.get("sample_id")
     if len(emit_modes) > 1:
         sample_id = f"{sample_id}:{mode_tag_suffix(vc_mode)}"
-    return {
+    out = {
         "sample_id": sample_id,
         "text": target_text,
         "instruction": build_instruction(
@@ -176,6 +207,43 @@ def build_sft_row(
             "target_codec_frames": row.get("target_codec_frames"),
         },
     }
+    for key in (
+        "source_text",
+        "target_text",
+        "timbre_ref_text",
+        "source_speaker_id",
+        "timbre_ref_speaker_id",
+        "target_speaker_id",
+        "source_gender",
+        "timbre_ref_gender",
+        "target_gender",
+        "validation_set",
+        "ref_channel_treatment",
+        "ref_channel_profile",
+        "ref_channel_seed",
+        "ref_channel_severity",
+        "ref_channel_target_sample_rate",
+        "timbre_ref_audio_original",
+        "timbre_ref_channel_augmented",
+        "timbre_ref_channel_augmentation",
+        "channel_shortcut_risk",
+        "v2_real_target",
+        "text_policy",
+    ):
+        if key in row:
+            out[key] = row.get(key)
+    meta = out["moss_codecvc_meta"]
+    for key in (
+        "source_text",
+        "target_text",
+        "timbre_ref_text",
+        "validation_set",
+        "ref_channel_treatment",
+        "ref_channel_profile",
+    ):
+        if key in row:
+            meta[key] = row.get(key)
+    return out
 
 
 def main() -> int:
@@ -221,6 +289,15 @@ def main() -> int:
         default=True,
         help="If manifest rows contain preferred_emit_mode, only emit that mode for that row.",
     )
+    ap.add_argument(
+        "--filter-v2-real-no-text-ref-content-leak",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For v2 real-target no-text triples, skip no_text rows whose timbre_ref_text "
+            "normalizes exactly to target_text. Those rows let S2 carry lexical content."
+        ),
+    )
     ap.add_argument("--disable-mode-token", action="store_true")
     args = ap.parse_args()
     emit_modes = parse_emit_modes(args.emit_modes)
@@ -258,11 +335,13 @@ def main() -> int:
         next_input_index = 0
         written = 0
         skipped = 0
+        filtered_ref_content_leak = 0
         mode = "w"
     else:
         next_input_index = int(resume_payload.get("next_input_index") or 0)
         written = int(resume_payload.get("written") or 0)
         skipped = int(resume_payload.get("skipped") or 0)
+        filtered_ref_content_leak = int(resume_payload.get("filtered_ref_content_leak") or 0)
         truncate_jsonl_to_lines(tmp_jsonl, written)
         mode = "a"
         print(
@@ -285,6 +364,7 @@ def main() -> int:
                 "next_input_index": current_next_input_index,
                 "written": written,
                 "skipped": skipped,
+                "filtered_ref_content_leak": filtered_ref_content_leak,
             },
         )
 
@@ -314,9 +394,23 @@ def main() -> int:
                 last_next_input_index = idx + 1
                 continue
             preferred_emit_mode = row.get("preferred_emit_mode")
+            row_emit_modes = []
             for vc_mode in emit_modes:
                 if args.respect_preferred_emit_mode and preferred_emit_mode and vc_mode != preferred_emit_mode:
                     continue
+                if (
+                    bool(args.filter_v2_real_no_text_ref_content_leak)
+                    and vc_mode == VC_MODE_NO_TEXT
+                    and is_v2_real_no_text_ref_content_leak(row)
+                ):
+                    filtered_ref_content_leak += 1
+                    continue
+                row_emit_modes.append(vc_mode)
+            if not row_emit_modes:
+                skipped += 1
+                last_next_input_index = idx + 1
+                continue
+            for vc_mode in row_emit_modes:
                 out_row = build_sft_row(
                     row,
                     source_codes=source_codes,
@@ -355,11 +449,16 @@ def main() -> int:
             "input_rows_processed": last_next_input_index,
             "written": written,
             "skipped": skipped,
+            "filtered_ref_content_leak": filtered_ref_content_leak,
+            "filter_v2_real_no_text_ref_content_leak": bool(args.filter_v2_real_no_text_ref_content_leak),
         },
     )
     if progress_json.exists():
         progress_json.unlink()
-    print(f"wrote {written} MOSS SFT rows -> {output_jsonl.resolve()} skipped={skipped}")
+    print(
+        f"wrote {written} MOSS SFT rows -> {output_jsonl.resolve()} "
+        f"skipped={skipped} filtered_ref_content_leak={filtered_ref_content_leak}"
+    )
     return 0
 
 
