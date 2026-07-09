@@ -1,0 +1,33 @@
+{
+  "runs": {
+    "v1sec_seq_pure_olddata_fix6_step-1000_quick20_d2d3_seed1234": {
+      "all": {
+        "n": 20,
+        "sim_gen_ref_mean": 0.15220080737490208,
+        "sim_gen_ref_std": 0.09215467887163004,
+        "sim_gen_source_mean": 0.4969782784581184,
+        "sim_gen_source_std": 0.13165745552405617
+      },
+      "no_text": {
+        "n": 20,
+        "sim_gen_ref_mean": 0.15220080737490208,
+        "sim_gen_ref_std": 0.09215467887163004,
+        "sim_gen_source_mean": 0.4969782784581184,
+        "sim_gen_source_std": 0.13165745552405617
+      },
+      "counterfactual": {
+        "selected_ref_mean": null,
+        "selected_ref_std": null,
+        "nonselected_ref_mean": null,
+        "nonselected_ref_std": null,
+        "selected_minus_nonselected_mean": null,
+        "output_pair_similarity_mean": null,
+        "output_pair_similarity_std": null
+      },
+      "run_dir": "/inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/MOSS-CodecVC/testset/outputs/ver2_9_v1sec_seq_pure_olddata_quick_eval/v1sec_seq_pure_olddata_fix6_step-1000_quick20_d2d3_seed1234"
+    }
+  },
+  "per_case_csv": "/inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/MOSS-CodecVC/testset/outputs/ver2_9_v1sec_seq_pure_olddata_quick_eval/v1sec_seq_pure_olddata_fix6_step-1000_quick20_d2d3_seed1234/v1sec_seq_pure_olddata_fix6_step-1000_quick20_d2d3_seed1234.speaker_sim.csv",
+  "matrix_csv": null,
+  "pairwise_csv": null
+}

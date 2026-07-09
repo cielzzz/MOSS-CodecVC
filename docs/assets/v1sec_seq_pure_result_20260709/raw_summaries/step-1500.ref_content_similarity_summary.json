@@ -1,0 +1,333 @@
+{
+  "asr_jsonl": "/inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/MOSS-CodecVC/testset/outputs/ver2_9_v1sec_seq_pure_olddata_quick_eval/v1sec_seq_pure_olddata_fix6_step-1500_quick20_d2d3_seed1234/v1sec_seq_pure_olddata_fix6_step-1500_quick20_d2d3_seed1234.asr_eval.jsonl",
+  "overall": {
+    "n": 20,
+    "ref_content_lcs_f1_mean": 0.06428641560160653,
+    "ref_content_lcs_recall_mean": 0.0695173723335488,
+    "ref_content_lcs_precision_mean": 0.061234570383177186,
+    "cer_mean": 0.05326577502623292,
+    "wer_mean": 0.06688125599890306
+  },
+  "by_cell": {
+    "en_src_en_ref_same_gender": {
+      "n": 3,
+      "ref_content_lcs_f1_mean": 0.3832612038571004,
+      "ref_content_lcs_recall_mean": 0.41697478991596637,
+      "ref_content_lcs_precision_mean": 0.3637860247767368,
+      "cer_mean": 0.0613339552238806,
+      "wer_mean": 0.11188811188811189
+    },
+    "en_src_zh_ref_f2m": {
+      "n": 3,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.026450950179763743,
+      "wer_mean": 0.06666666666666667
+    },
+    "en_src_zh_ref_m2f": {
+      "n": 3,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.0,
+      "wer_mean": 0.0
+    },
+    "en_src_zh_ref_same_gender": {
+      "n": 3,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.0,
+      "wer_mean": 0.0
+    },
+    "zh_src_en_ref_f2m": {
+      "n": 2,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.125,
+      "wer_mean": 0.125
+    },
+    "zh_src_en_ref_m2f": {
+      "n": 2,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.125,
+      "wer_mean": 0.125
+    },
+    "zh_src_en_ref_same_gender": {
+      "n": 2,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.11764705882352941,
+      "wer_mean": 0.11764705882352941
+    },
+    "zh_src_zh_ref_same_gender": {
+      "n": 2,
+      "ref_content_lcs_f1_mean": 0.06797235023041476,
+      "ref_content_lcs_recall_mean": 0.06971153846153846,
+      "ref_content_lcs_precision_mean": 0.06666666666666667,
+      "cer_mean": 0.03333333333333333,
+      "wer_mean": 0.03333333333333333
+    }
+  },
+  "by_lang_pair": {
+    "en->en": {
+      "n": 3,
+      "ref_content_lcs_f1_mean": 0.3832612038571004,
+      "ref_content_lcs_recall_mean": 0.41697478991596637,
+      "ref_content_lcs_precision_mean": 0.3637860247767368,
+      "cer_mean": 0.0613339552238806,
+      "wer_mean": 0.11188811188811189
+    },
+    "en->zh": {
+      "n": 9,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.00881698339325458,
+      "wer_mean": 0.022222222222222223
+    },
+    "zh->en": {
+      "n": 6,
+      "ref_content_lcs_f1_mean": 0.0,
+      "ref_content_lcs_recall_mean": 0.0,
+      "ref_content_lcs_precision_mean": 0.0,
+      "cer_mean": 0.12254901960784315,
+      "wer_mean": 0.12254901960784315
+    },
+    "zh->zh": {
+      "n": 2,
+      "ref_content_lcs_f1_mean": 0.06797235023041476,
+      "ref_content_lcs_recall_mean": 0.06971153846153846,
+      "ref_content_lcs_precision_mean": 0.06666666666666667,
+      "cer_mean": 0.03333333333333333,
+      "wer_mean": 0.03333333333333333
+    }
+  },
+  "top_ref_content_matches": [
+    {
+      "case_id": "seedtts_no_text_en_src_en_ref_same_gender_000001",
+      "cell": "en_src_en_ref_same_gender",
+      "source_lang": "en",
+      "ref_lang": "en",
+      "cer_tgt": 0.109375,
+      "ref_content_lcs_f1": 0.4159999999999999,
+      "ref_content_lcs_recall": 0.38235294117647056,
+      "asr_tgt_text": "It featured criticals as well as reviews of short fiction and novels.",
+      "timbre_ref_text": "Each year there is a special on Japanese television and radio featuring her songs."
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_en_ref_same_gender_000002",
+      "cell": "en_src_en_ref_same_gender",
+      "source_lang": "en",
+      "ref_lang": "en",
+      "cer_tgt": 0.07462686567164178,
+      "ref_content_lcs_f1": 0.3728813559322034,
+      "ref_content_lcs_recall": 0.44,
+      "asr_tgt_text": "The unincorporated community of Colinetville was located partially in the town.",
+      "timbre_ref_text": "A remake is a motion picture based on a film produced earlier."
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_en_ref_same_gender_000000",
+      "cell": "en_src_en_ref_same_gender",
+      "source_lang": "en",
+      "ref_lang": "en",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.3609022556390978,
+      "ref_content_lcs_recall": 0.42857142857142855,
+      "asr_tgt_text": "She then joined her former colleagues to work on algorithmic financial market predictions.",
+      "timbre_ref_text": "Anybody from the community has the potential to become a role model."
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_zh_ref_same_gender_000000",
+      "cell": "zh_src_zh_ref_same_gender",
+      "source_lang": "zh",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.07142857142857144,
+      "ref_content_lcs_recall": 0.07692307692307693,
+      "asr_tgt_text": "体验是用户感知，是主观的用户价值。",
+      "timbre_ref_text": "好，先听听海报，那时，生活费用低。"
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_zh_ref_same_gender_000001",
+      "cell": "zh_src_zh_ref_same_gender",
+      "source_lang": "zh",
+      "ref_lang": "zh",
+      "cer_tgt": 0.06666666666666667,
+      "ref_content_lcs_f1": 0.06451612903225808,
+      "ref_content_lcs_recall": 0.0625,
+      "asr_tgt_text": "阿布多掏出一瓶药水，叫花朵朵喝下。",
+      "timbre_ref_text": "爱是四月天里的云烟，是细雨洒在花前。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_f2m_000000",
+      "cell": "en_src_zh_ref_f2m",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "If you start your emails with \"Greetings,\" let me be the first to welcome you to Earth.",
+      "timbre_ref_text": "织啊织织啊织终于，围巾织好了。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_f2m_000001",
+      "cell": "en_src_zh_ref_f2m",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.03389830508474576,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "There is no danger,\" the boys said when they had moved on past the encampment.",
+      "timbre_ref_text": "他翻着翻着，突然摸到一件鼓鼓囊囊的东西。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_f2m_000002",
+      "cell": "en_src_zh_ref_f2m",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.045454545454545456,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "The band also made its first appearance at the Boston St. Patrick's Day Parade.",
+      "timbre_ref_text": "提升服务标准，持续为用户创造价值。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_m2f_000000",
+      "cell": "en_src_zh_ref_m2f",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "In early life, he revealed no homosexual tendencies.",
+      "timbre_ref_text": "臭氧作为大气首要污染物达到十二天。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_m2f_000001",
+      "cell": "en_src_zh_ref_m2f",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "Television can make you dumb, but it can also be good education.",
+      "timbre_ref_text": "第十四章海盗们野外乐逍遥。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_m2f_000002",
+      "cell": "en_src_zh_ref_m2f",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "Not specifically, no. He only gave me the gist of his research the one time I spoke to him.",
+      "timbre_ref_text": "我是特意要来淋雨的，这种感觉很舒服。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_same_gender_000000",
+      "cell": "en_src_zh_ref_same_gender",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "Bombelles was the former custodian of his aunt, Empress Charlotte of Mexico.",
+      "timbre_ref_text": "一直找到狗窝这里，他在离狗窝不远的地方蹲了下来。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_same_gender_000001",
+      "cell": "en_src_zh_ref_same_gender",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "I generally like jazz, but this record is oversteered. Thanks, Loudness War.",
+      "timbre_ref_text": "只剩下寥寥无几的几颗钉子扎根下去。"
+    },
+    {
+      "case_id": "seedtts_no_text_en_src_zh_ref_same_gender_000002",
+      "cell": "en_src_zh_ref_same_gender",
+      "source_lang": "en",
+      "ref_lang": "zh",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "They would be indicted on federal charges of bid rigging to get government contracts.",
+      "timbre_ref_text": "许多研究都证实大蒜，具有防癌抗癌能力。"
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_en_ref_f2m_000000",
+      "cell": "zh_src_en_ref_f2m",
+      "source_lang": "zh",
+      "ref_lang": "en",
+      "cer_tgt": 0.25,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "仅仅依靠两百万名快递，仅仅约完成。",
+      "timbre_ref_text": "Treatment is possible but unless continued daily, problems may arise."
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_en_ref_f2m_000001",
+      "cell": "zh_src_en_ref_f2m",
+      "source_lang": "zh",
+      "ref_lang": "en",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "四九，一座小庄园，狮子接过信，读起来。",
+      "timbre_ref_text": "Potter is eligible to represent both Australia and England at senior international level."
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_en_ref_m2f_000000",
+      "cell": "zh_src_en_ref_m2f",
+      "source_lang": "zh",
+      "ref_lang": "en",
+      "cer_tgt": 0.25,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "出售原因是人人车独立开发，获批免证。",
+      "timbre_ref_text": "The autonomous ship floated closer to receiving its flying cargo."
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_en_ref_m2f_000001",
+      "cell": "zh_src_en_ref_m2f",
+      "source_lang": "zh",
+      "ref_lang": "en",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "在美国艾森豪威尔政府的怂恿和包庇下。",
+      "timbre_ref_text": "This episode was Bernard Herrmann's final score for the series."
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_en_ref_same_gender_000000",
+      "cell": "zh_src_en_ref_same_gender",
+      "source_lang": "zh",
+      "ref_lang": "en",
+      "cer_tgt": 0.0,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "以后会养的，我在研究宠物照顾技能。",
+      "timbre_ref_text": "The exclusion of professionals caused several controversies throughout the history of the modern Olympics."
+    },
+    {
+      "case_id": "seedtts_no_text_zh_src_en_ref_same_gender_000001",
+      "cell": "zh_src_en_ref_same_gender",
+      "source_lang": "zh",
+      "ref_lang": "en",
+      "cer_tgt": 0.23529411764705882,
+      "ref_content_lcs_f1": 0.0,
+      "ref_content_lcs_recall": 0.0,
+      "asr_tgt_text": "因此，他现在也只好暂时遇难下去了。",
+      "timbre_ref_text": "At other times, at a crucial moment, I make it easier for things to happen."
+    }
+  ]
+}
