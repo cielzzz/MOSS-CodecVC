@@ -229,8 +229,22 @@ def infer_language(row: dict[str, Any]) -> str:
 
 def group_key(row: dict[str, Any], mode: str) -> str:
     for key in (
+        "target_pseudo_speaker_id",
+        "target_speaker_pseudo_id",
         "target_speaker_id",
+        "timbre_ref_pseudo_speaker_id",
+        "timbre_ref_speaker_pseudo_id",
+        "timbre_ref_speaker_id",
+        "source_pseudo_speaker_id",
+        "source_speaker_pseudo_id",
+        "source_speaker_id",
+        "pseudo_speaker_id",
         "speaker_id",
+    ):
+        value = nested_get(row, key)
+        if value not in (None, ""):
+            return f"{mode}:{key}:{value}"
+    for key in (
         "target_speaker_embedding_path",
         "timbre_ref_speaker_embedding_path",
         "source_speaker_embedding_path",
@@ -240,7 +254,7 @@ def group_key(row: dict[str, Any], mode: str) -> str:
     ):
         value = nested_get(row, key)
         if value not in (None, ""):
-            return f"{mode}:{key}:{value}"
+            return f"{mode}:fallback_{key}:{value}"
     return f"{mode}:row:{hashlib.sha1(json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
 
 
@@ -377,6 +391,11 @@ def split_rows(
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[group_key(row, mode)].append(row)
+    if len(groups) == len(rows) and len(rows) > 1:
+        raise RuntimeError(
+            f"{mode} split has groups==rows ({len(groups)}); refusing row-level random valid split. "
+            "Attach true/pseudo speaker ids first."
+        )
     group_items = list(groups.items())
     rng = random.Random(int(args.seed) + (17 if mode == "text" else 0))
     rng.shuffle(group_items)
