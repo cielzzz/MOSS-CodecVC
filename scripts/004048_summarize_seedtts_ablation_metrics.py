@@ -12,12 +12,18 @@ from typing import Any
 
 import torch
 import torchaudio
+import torch.nn.functional as F
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_VALIDATION_JSONL = ROOT / "testset/validation/seedtts_vc_ver2_3_validation.jsonl"
 DEFAULT_SPEAKER_SIM_ROOT = Path(
     "/inspire/qb-ilm2/project/embodied-multimodality/public/xyzhang/projects/vcdata_construction"
+)
+DEFAULT_SPEECHBRAIN_ECAPA_DIR = Path(
+    "/inspire/ssd/project/embodied-multimodality/public/xyzhang/download/models/speechbrain/spkrec-ecapa-voxceleb"
 )
 
 
@@ -31,6 +37,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--skip-speaker", action="store_true")
     ap.add_argument("--speaker-device", default="cuda:0")
     ap.add_argument("--speaker-sim-root", default=str(DEFAULT_SPEAKER_SIM_ROOT))
+    ap.add_argument("--extra-speaker-encoder", choices=("none", "speechbrain_ecapa"), default="none")
+    ap.add_argument("--extra-speaker-device", default="", help="Defaults to --speaker-device when unset.")
+    ap.add_argument("--speechbrain-ecapa-model-source", default=str(DEFAULT_SPEECHBRAIN_ECAPA_DIR))
     ap.add_argument("--failure-cer-threshold", type=float, default=0.30)
     return ap.parse_args()
 
@@ -107,6 +116,19 @@ def coverage(reference: str, hypothesis: str) -> float | None:
     return lcs_len(ref, hyp) / max(1, len(ref))
 
 
+def load_audio_mono(path: str | Path) -> tuple[torch.Tensor, int]:
+    try:
+        wav, sr = torchaudio.load(str(path))
+    except Exception:
+        try:
+            import soundfile as sf
+        except ImportError:
+            raise
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        wav = torch.from_numpy(data.T)
+    return wav.float().mean(dim=0), int(sr)
+
+
 def silence_metrics(path: str | Path) -> dict[str, float | None]:
     path = Path(path)
     if not path.exists():
@@ -116,7 +138,7 @@ def silence_metrics(path: str | Path) -> dict[str, float | None]:
             "tail_silence_ratio": None,
             "total_silence_ratio": None,
         }
-    wav, sr = torchaudio.load(str(path))
+    wav, sr = load_audio_mono(path)
     if wav.numel() == 0:
         return {
             "audio_sec": 0.0,
@@ -124,7 +146,6 @@ def silence_metrics(path: str | Path) -> dict[str, float | None]:
             "tail_silence_ratio": None,
             "total_silence_ratio": None,
         }
-    wav = wav.float().mean(dim=0)
     frame = max(1, int(round(0.050 * sr)))
     hop = max(1, int(round(0.010 * sr)))
     if wav.numel() < frame:
@@ -208,6 +229,57 @@ class SpeakerScorer:
             return None
 
 
+class SpeechBrainEcapaScorer:
+    def __init__(self, model_source: Path, device: str) -> None:
+        from moss_codecvc.third_party import add_download_python_deps
+
+        add_download_python_deps()
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except ImportError:
+            from speechbrain.pretrained import EncoderClassifier
+
+        self.device = torch.device(device if torch.cuda.is_available() or not device.startswith("cuda") else "cpu")
+        kwargs: dict[str, Any] = {"source": str(model_source)}
+        if model_source.exists():
+            local_source = str(model_source.resolve())
+            kwargs["source"] = local_source
+            kwargs["overrides"] = {"pretrained_path": local_source}
+            kwargs["savedir"] = local_source
+        try:
+            kwargs["run_opts"] = {"device": str(self.device)}
+            self.backend = EncoderClassifier.from_hparams(**kwargs)
+        except TypeError:
+            kwargs.pop("run_opts", None)
+            self.backend = EncoderClassifier.from_hparams(**kwargs).to(self.device)
+        self.backend.eval()
+        for param in self.backend.parameters():
+            param.requires_grad = False
+        self.cache: dict[str, torch.Tensor] = {}
+
+    @torch.inference_mode()
+    def embed(self, path: str | Path) -> torch.Tensor:
+        key = str(path)
+        if key not in self.cache:
+            if hasattr(self.backend, "encode_file"):
+                embedding = self.backend.encode_file(key).squeeze()
+            else:
+                signal = self.backend.load_audio(key).to(self.device)
+                embedding = self.backend.encode_batch(signal.unsqueeze(0)).squeeze()
+            embedding = torch.as_tensor(embedding, dtype=torch.float32, device="cpu").flatten()
+            self.cache[key] = F.normalize(embedding, dim=0)
+        return self.cache[key]
+
+    def similarity(self, a: str | Path, b: str | Path) -> float | None:
+        try:
+            left = self.embed(a).unsqueeze(0)
+            right = self.embed(b).unsqueeze(0)
+            return float(F.cosine_similarity(left, right).item())
+        except Exception as exc:
+            print(f"[ecapa-sim] failed {a} vs {b}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return None
+
+
 def summarize_group(rows: list[dict[str, Any]], failure_threshold: float) -> dict[str, Any]:
     cer = [finite(row.get("cer_tgt")) for row in rows]
     failure_values = [v for v in cer if v is not None]
@@ -232,6 +304,10 @@ def summarize_group(rows: list[dict[str, Any]], failure_threshold: float) -> dic
         "sim_gen_ref_std": std([finite(row.get("sim_gen_ref")) for row in rows]),
         "sim_gen_source_mean": mean([finite(row.get("sim_gen_source")) for row in rows]),
         "sim_gen_source_std": std([finite(row.get("sim_gen_source")) for row in rows]),
+        "ecapa_sim_gen_ref_mean": mean([finite(row.get("ecapa_sim_gen_ref")) for row in rows]),
+        "ecapa_sim_gen_ref_std": std([finite(row.get("ecapa_sim_gen_ref")) for row in rows]),
+        "ecapa_sim_gen_source_mean": mean([finite(row.get("ecapa_sim_gen_source")) for row in rows]),
+        "ecapa_sim_gen_source_std": std([finite(row.get("ecapa_sim_gen_source")) for row in rows]),
         "delay_minus_min_audio_mean": mean([finite(row.get("delay_minus_min_audio")) for row in rows]),
         "delay_minus_min_audio_std": std([finite(row.get("delay_minus_min_audio")) for row in rows]),
     }
@@ -241,6 +317,10 @@ def main() -> int:
     args = parse_args()
     validation = {str(row.get("case_id") or ""): row for row in iter_jsonl(Path(args.validation_jsonl))}
     scorer = None if args.skip_speaker else SpeakerScorer(Path(args.speaker_sim_root), args.speaker_device)
+    extra_scorer = None
+    if args.extra_speaker_encoder == "speechbrain_ecapa":
+        extra_device = args.extra_speaker_device or args.speaker_device
+        extra_scorer = SpeechBrainEcapaScorer(Path(args.speechbrain_ecapa_model_source).expanduser(), extra_device)
 
     per_case: list[dict[str, Any]] = []
     run_summaries: dict[str, dict[str, Any]] = {}
@@ -297,6 +377,16 @@ def main() -> int:
             else:
                 item["sim_gen_ref"] = None
                 item["sim_gen_source"] = None
+            if extra_scorer is not None and target_audio and Path(target_audio).exists():
+                item["ecapa_sim_gen_ref"] = (
+                    extra_scorer.similarity(target_audio, timbre_ref_audio) if timbre_ref_audio else None
+                )
+                item["ecapa_sim_gen_source"] = (
+                    extra_scorer.similarity(target_audio, source_audio) if source_audio else None
+                )
+            else:
+                item["ecapa_sim_gen_ref"] = None
+                item["ecapa_sim_gen_source"] = None
             rows.append(item)
             per_case.append(item)
         run_summaries[run_name] = summarize_group(rows, float(args.failure_cer_threshold))
@@ -318,6 +408,8 @@ def main() -> int:
         "total_silence_ratio",
         "sim_gen_ref",
         "sim_gen_source",
+        "ecapa_sim_gen_ref",
+        "ecapa_sim_gen_source",
         "first_delay_pos",
         "delay_minus_min_audio",
         "gen_slot_count",
@@ -359,12 +451,12 @@ def main() -> int:
         "",
         f"failure threshold: `CER > {float(args.failure_cer_threshold):.2f}`",
         "",
-        "| run | n | fail rate | CER mean±std | coverage mean±std | repeat | tail silence | total silence | sim gen-ref | sim gen-source | delay-min_audio |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| run | n | fail rate | CER mean±std | coverage mean±std | repeat | tail silence | total silence | WavLM-SV gen-ref | WavLM-SV gen-source | ECAPA gen-ref | ECAPA gen-source | delay-min_audio |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for run_name, payload in run_summaries.items():
         lines.append(
-            "| {run} | {n} | {fail} | {cer_m}±{cer_s} | {cov_m}±{cov_s} | {rep} | {tail} | {sil} | {ref} | {src} | {delay} |".format(
+            "| {run} | {n} | {fail} | {cer_m}±{cer_s} | {cov_m}±{cov_s} | {rep} | {tail} | {sil} | {ref} | {src} | {ecapa_ref} | {ecapa_src} | {delay} |".format(
                 run=run_name,
                 n=payload["n"],
                 fail=fmt(payload["failure_rate_cer_gt_threshold"]),
@@ -377,6 +469,8 @@ def main() -> int:
                 sil=fmt(payload["total_silence_ratio_mean"]),
                 ref=fmt(payload["sim_gen_ref_mean"]),
                 src=fmt(payload["sim_gen_source_mean"]),
+                ecapa_ref=fmt(payload["ecapa_sim_gen_ref_mean"]),
+                ecapa_src=fmt(payload["ecapa_sim_gen_source_mean"]),
                 delay=fmt(payload["delay_minus_min_audio_mean"]),
             )
         )

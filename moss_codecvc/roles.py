@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -109,3 +110,51 @@ def infer_prompt_role_ids_from_audio_spans(input_ids: torch.Tensor, *, audio_pad
             start, end = spans[1]
             role_ids[batch_idx, start:end] = REF_CODEC
     return role_ids
+
+
+def ref_speaker_prompt_slot_positions(
+    input_ids: torch.Tensor,
+    *,
+    audio_start_token_id: int,
+    audio_end_token_id: int,
+    audio_gen_slot_token_id: int | Iterable[int],
+    token_count: int,
+    occurrence: int = 2,
+) -> torch.Tensor:
+    """Locate K prompt-slot positions in the Nth audio block.
+
+    The slot uses a fake S2 audio placeholder whose audio channels may all be
+    pad codes, so it cannot be found from audio activity. We instead use the
+    text channel audio block markers and select the first K gen-slot tokens.
+    """
+
+    if input_ids.dim() != 3:
+        raise ValueError(f"input_ids must be [B, T, C], got {tuple(input_ids.shape)}")
+    positions = torch.zeros(input_ids.shape[:2], dtype=torch.bool, device=input_ids.device)
+    k = int(token_count)
+    if k <= 0:
+        return positions
+    occurrence = max(1, int(occurrence))
+    if isinstance(audio_gen_slot_token_id, Iterable) and not isinstance(audio_gen_slot_token_id, (str, bytes)):
+        slot_token_ids = [int(value) for value in audio_gen_slot_token_id]
+    else:
+        slot_token_ids = [int(audio_gen_slot_token_id)]
+    text_tokens = input_ids[..., 0]
+    for batch_idx in range(int(text_tokens.shape[0])):
+        row = text_tokens[batch_idx]
+        starts = torch.nonzero(row == int(audio_start_token_id), as_tuple=False).flatten()
+        if int(starts.numel()) < occurrence:
+            continue
+        start = int(starts[occurrence - 1].item())
+        end_candidates = torch.nonzero(row[start + 1 :] == int(audio_end_token_id), as_tuple=False).flatten()
+        end = int(row.shape[0]) if int(end_candidates.numel()) == 0 else start + 1 + int(end_candidates[0].item())
+        block = row[start : end + 1]
+        slot_mask = torch.zeros_like(block, dtype=torch.bool)
+        for slot_token_id in slot_token_ids:
+            slot_mask |= block == int(slot_token_id)
+        gen_idxs = torch.nonzero(slot_mask, as_tuple=False).flatten()
+        if int(gen_idxs.numel()) == 0:
+            continue
+        selected = gen_idxs[:k] + start
+        positions[batch_idx, selected.to(device=positions.device)] = True
+    return positions

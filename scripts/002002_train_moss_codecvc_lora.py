@@ -9,6 +9,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import time
@@ -73,6 +74,18 @@ def parse_args() -> argparse.Namespace:
             "--train-jsonl-spec. Repeats are honored only when explicitly specified."
         ),
     )
+    ap.add_argument("--eval-seen-jsonl", default=None, help="Optional seen-valid JSONL for teacher-forced eval.")
+    ap.add_argument(
+        "--eval-seen-jsonl-spec",
+        default=None,
+        help="Optional seen-valid eval spec using the same syntax as --train-jsonl-spec.",
+    )
+    ap.add_argument("--eval-unseen-jsonl", default=None, help="Optional unseen-valid JSONL for teacher-forced eval.")
+    ap.add_argument(
+        "--eval-unseen-jsonl-spec",
+        default=None,
+        help="Optional unseen-valid eval spec using the same syntax as --train-jsonl-spec.",
+    )
     ap.add_argument(
         "--eval-steps",
         type=int,
@@ -92,6 +105,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--learning-rate", type=float, default=1e-4)
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--warmup-ratio", type=float, default=0.03)
+    ap.add_argument(
+        "--lr-scheduler-type",
+        default=os.environ.get("LR_SCHEDULER_TYPE", "cosine"),
+        help="Transformers scheduler type, e.g. cosine, constant, or constant_with_warmup.",
+    )
     ap.add_argument("--num-epochs", type=int, default=1)
     ap.add_argument("--max-train-steps", type=int, default=0)
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -124,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--timbre-speaker-conditioning", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument(
         "--speaker-encoder-type",
-        choices=("embedding_loader", "precomputed_ecapa", "speechbrain_ecapa", "seed_tts_eval_ecapa"),
+        choices=("embedding_loader", "precomputed_ecapa", "speechbrain_ecapa", "seed_tts_eval_ecapa", "wavlm_sv"),
         default=None,
     )
     ap.add_argument("--speaker-encoder-path", default=None)
@@ -134,6 +152,74 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--speaker-loss-margin", type=float, default=None)
     ap.add_argument("--speaker-loss-warmup-steps", type=int, default=None)
     ap.add_argument("--speaker-loss-warmup-weight", type=float, default=None)
+    ap.add_argument("--speaker-loss-schedule", choices=("step", "cosine"), default=None)
+    ap.add_argument("--ref-speaker-prompt-tokens", type=int, default=None)
+    ap.add_argument("--ref-speaker-prompt-dropout", type=float, default=None)
+    ap.add_argument("--ref-speaker-prompt-mode", choices=("memory", "slot", "both"), default=None)
+    ap.add_argument(
+        "--ref-speaker-prompt-token-source",
+        choices=("speaker_mlp", "timbre_memory"),
+        default=None,
+        help="Soft-token source for ref speaker prompt slot. speaker_mlp is A1; timbre_memory reuses T_ref tokens for A3.",
+    )
+    ap.add_argument("--ref-speaker-prompt-slot", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--ref-speaker-prompt-slot-code", type=int, default=None)
+    ap.add_argument("--ref-speaker-prompt-slot-pack-mode", choices=("pad", "audio_like"), default=None)
+    ap.add_argument("--ref-speaker-prompt-output-norm", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--ref-speaker-prompt-output-scale", type=float, default=None)
+    ap.add_argument("--ref-prompt-codec-permutation", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--ref-prompt-codec-permutation-min-seconds", type=float, default=None)
+    ap.add_argument("--ref-prompt-codec-permutation-max-seconds", type=float, default=None)
+    ap.add_argument("--ref-prompt-codec-permutation-frame-rate", type=float, default=None)
+    ap.add_argument("--ref-prompt-codec-permutation-seed", type=int, default=None)
+    ap.add_argument("--ref-prompt-codec-permutation-mode", choices=("shuffle", "contiguous", "block_shuffle"), default=None)
+    ap.add_argument("--ref-prompt-codec-permutation-block-seconds", type=float, default=None)
+    ap.add_argument(
+        "--ref-speaker-prompt-lr-multiplier",
+        type=float,
+        default=1.0,
+        help="LR multiplier for ref_speaker_prompt MLP parameters. 1.0 keeps them in the base group.",
+    )
+    ap.add_argument(
+        "--target-front-ce-weight",
+        type=float,
+        default=None,
+        help="CE multiplier for the first target audio frames. 1 disables A4 weighting.",
+    )
+    ap.add_argument(
+        "--target-front-ce-seconds",
+        type=float,
+        default=None,
+        help="Duration in seconds for A4 front-target CE upweight. 0 disables it.",
+    )
+    ap.add_argument(
+        "--target-front-ce-frame-rate",
+        type=float,
+        default=None,
+        help="Codec frame rate used to convert A4 seconds to target frames.",
+    )
+    ap.add_argument("--ref-speaker-adaln-weight", type=float, default=None)
+    ap.add_argument("--speaker-infonce-weight", type=float, default=None)
+    ap.add_argument("--speaker-infonce-temperature", type=float, default=None)
+    ap.add_argument("--speaker-infonce-negative-pool-size", type=int, default=None)
+    ap.add_argument("--speaker-infonce-negative-pool-seed", type=int, default=None)
+    ap.add_argument("--speaker-condition-dropout", type=float, default=None)
+    ap.add_argument("--enable-speaker-side-pathway", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--speaker-side-pathway-layers", default=None)
+    ap.add_argument("--speaker-side-pathway-kv-bias", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--speaker-side-pathway-gate-init", type=float, default=None)
+    ap.add_argument("--speaker-side-pathway-dropout", type=float, default=None)
+    ap.add_argument("--enable-speaker-cross-attn", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--speaker-cross-attn-layers", default=None)
+    ap.add_argument("--speaker-cross-attn-tokens", type=int, default=None)
+    ap.add_argument("--speaker-cross-attn-gate-init", type=float, default=None)
+    ap.add_argument("--speaker-cross-attn-dropout", type=float, default=None)
+    ap.add_argument("--speaker-cross-attn-output-scale", type=float, default=None)
+    ap.add_argument("--speaker-cross-attn-token-init-std", type=float, default=None)
+    ap.add_argument("--speaker-cross-attn-alpha-warmup-steps", type=int, default=None)
+    ap.add_argument("--speaker-cross-attn-source", choices=("vector", "sequence"), default=None)
+    ap.add_argument("--speaker-cross-attn-seq-dim", type=int, default=None)
+    ap.add_argument("--use-perturbed-source-prompt", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--enable-role-routing", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--enable-target-head-routing", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument(
@@ -356,6 +442,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--smoke-test", action="store_true")
     ap.add_argument("--pack-only", action="store_true", help="Validate dataset packing and exit before loading model weights.")
+    ap.add_argument("--eval-only", action="store_true", help="Load model/checkpoint, run eval loaders once, and exit.")
     return ap.parse_args()
 
 
@@ -707,10 +794,18 @@ def load_training_records(args: argparse.Namespace):
     )
 
 
-def load_eval_records(args: argparse.Namespace):
-    if args.eval_jsonl and args.eval_jsonl_spec:
-        raise ValueError("Use only one of --eval-jsonl or --eval-jsonl-spec")
-    specs = parse_train_jsonl_spec(args.eval_jsonl_spec)
+def load_eval_records_from_sources(
+    *,
+    label: str,
+    jsonl_path: str | None,
+    jsonl_spec: str | None,
+    args: argparse.Namespace,
+):
+    if jsonl_path and jsonl_spec:
+        if label == "eval":
+            raise ValueError("Use only one of --eval-jsonl or --eval-jsonl-spec")
+        raise ValueError(f"Use only one of --eval-{label}-jsonl or --eval-{label}-jsonl-spec")
+    specs = parse_train_jsonl_spec(jsonl_spec)
     if specs:
         sources: list[RepeatedRecords] = []
         for idx, spec in enumerate(specs):
@@ -723,22 +818,52 @@ def load_eval_records(args: argparse.Namespace):
             repeated = RepeatedRecords(records, repeat=spec.repeat)
             sources.append(repeated)
             print(
-                "[eval-jsonl-spec] "
+                f"[eval-{label}-jsonl-spec] "
                 f"source={idx} path={spec.path} rows={len(records)} repeat={spec.repeat} "
                 f"effective_rows={len(repeated)} max_rows={int(spec.max_rows)}",
                 flush=True,
             )
         combined = ConcatRecords(sources)
-        print(f"[eval-jsonl-spec] effective_total_rows={len(combined)} sources={len(sources)}", flush=True)
+        print(f"[eval-{label}-jsonl-spec] effective_total_rows={len(combined)} sources={len(sources)}", flush=True)
         return combined
-    if args.eval_jsonl:
+    if jsonl_path:
+        print(f"[eval-{label}-jsonl] path={jsonl_path}", flush=True)
         return load_records(
-            args.eval_jsonl,
+            jsonl_path,
             0,
             jsonl_index_path=None,
             rebuild_jsonl_index=args.rebuild_jsonl_index,
         )
     return None
+
+
+def load_eval_records(args: argparse.Namespace):
+    return load_eval_records_from_sources(
+        label="eval",
+        jsonl_path=args.eval_jsonl,
+        jsonl_spec=args.eval_jsonl_spec,
+        args=args,
+    )
+
+
+def load_named_eval_records(args: argparse.Namespace) -> list[tuple[str, Any]]:
+    named: list[tuple[str, Any]] = []
+    legacy = load_eval_records(args)
+    if legacy is not None:
+        named.append(("eval", legacy))
+    for label, jsonl_path, jsonl_spec in (
+        ("seen", args.eval_seen_jsonl, args.eval_seen_jsonl_spec),
+        ("unseen", args.eval_unseen_jsonl, args.eval_unseen_jsonl_spec),
+    ):
+        records = load_eval_records_from_sources(
+            label=label,
+            jsonl_path=jsonl_path,
+            jsonl_spec=jsonl_spec,
+            args=args,
+        )
+        if records is not None:
+            named.append((label, records))
+    return named
 
 
 def _record_value(record: dict[str, Any], key: str) -> Any | None:
@@ -748,6 +873,46 @@ def _record_value(record: dict[str, Any], key: str) -> Any | None:
     if isinstance(meta, dict) and meta.get(key) not in (None, ""):
         return meta[key]
     return None
+
+
+def sample_timbre_ref_speaker_embedding_paths(
+    records,
+    *,
+    pool_size: int,
+    seed: int,
+    max_attempt_multiplier: int = 64,
+) -> list[str]:
+    requested = int(pool_size)
+    if requested <= 0:
+        return []
+    total = len(records)
+    if total <= 0:
+        raise ValueError("Cannot sample speaker InfoNCE negatives from an empty training set")
+    rng = random.Random(int(seed))
+    selected: list[str] = []
+    seen: set[str] = set()
+    max_attempts = max(requested * int(max_attempt_multiplier), requested + 100)
+    attempts = 0
+    while len(selected) < requested and attempts < max_attempts:
+        attempts += 1
+        record = records[rng.randrange(total)]
+        value = _record_value(record, "timbre_ref_speaker_embedding_path")
+        if value in (None, ""):
+            value = _record_value(record, "target_speaker_embedding_path")
+        if value in (None, ""):
+            continue
+        path = str(value)
+        if path in seen:
+            continue
+        seen.add(path)
+        selected.append(path)
+    if len(selected) < requested:
+        raise ValueError(
+            "Could not sample enough unique timbre_ref_speaker_embedding_path values for "
+            f"speaker InfoNCE negative pool: requested={requested} got={len(selected)} "
+            f"attempts={attempts} total_rows={total}"
+        )
+    return selected
 
 
 def _int_record_value(record: dict[str, Any], *keys: str) -> int:
@@ -1141,6 +1306,13 @@ def apply_ver25_freeze_controls(model: torch.nn.Module, args: argparse.Namespace
         "semantic_feature_head",
         "progress_stop_head",
         "source_prosody_encoder",
+        "speaker_side_adaln",
+        "speaker_side_kv_bias",
+        "speaker_side_gate_logits",
+        "speaker_cross_attn_tokens",
+        "speaker_cross_attn_seq_projector",
+        "speaker_cross_attn_layers",
+        "null_speaker_embedding",
     )
     route_markers = (
         "role_router",
@@ -1218,9 +1390,13 @@ def is_source_semantic_gate_param_name(name: str) -> bool:
 
 def is_timbre_adapter_gate_param_name(name: str) -> bool:
     return (
-        "source_semantic_layer_adapters" not in name
-        and "layer_adapters" in name
-        and name.endswith(".gate")
+        (
+            "source_semantic_layer_adapters" not in name
+            and "layer_adapters" in name
+            and name.endswith(".gate")
+        )
+        or "speaker_side_gate_logits" in name
+        or ("speaker_cross_attn_layers" in name and name.endswith(".gate_logit"))
     )
 
 
@@ -1345,6 +1521,7 @@ def build_optimizer_param_groups(
     source_semantic_gate_lr_multiplier: float = 10.0,
     content_ctc_head_lr_multiplier: float = 1.0,
     timbre_adapter_gate_lr_multiplier: float = 1.0,
+    ref_speaker_prompt_lr_multiplier: float = 1.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     gate_named_params = routing_gate_parameters(model)
     gate_param_ids = {id(param) for param in gate_named_params.values()}
@@ -1369,6 +1546,15 @@ def build_optimizer_param_groups(
     }
     use_ctc_head_group = bool(ctc_head_named_params) and float(content_ctc_head_lr_multiplier) != 1.0
     ctc_head_param_ids = {id(param) for param in ctc_head_named_params.values()} if use_ctc_head_group else set()
+    ref_speaker_prompt_named_params = {
+        name: param
+        for name, param in model.named_parameters()
+        if "ref_speaker_prompt" in name and param.requires_grad
+    }
+    use_ref_speaker_prompt_group = bool(ref_speaker_prompt_named_params) and float(ref_speaker_prompt_lr_multiplier) != 1.0
+    ref_speaker_prompt_param_ids = (
+        {id(param) for param in ref_speaker_prompt_named_params.values()} if use_ref_speaker_prompt_group else set()
+    )
     base_params = [
         param
         for param in model.parameters()
@@ -1379,6 +1565,7 @@ def build_optimizer_param_groups(
             and id(param) not in timbre_adapter_gate_param_ids
             and id(param) not in source_semantic_param_ids
             and id(param) not in ctc_head_param_ids
+            and id(param) not in ref_speaker_prompt_param_ids
         )
     ]
     param_groups: list[dict[str, Any]] = [{"params": base_params, "lr": float(learning_rate), "weight_decay": float(weight_decay)}]
@@ -1405,6 +1592,11 @@ def build_optimizer_param_groups(
         "content_ctc_head_tensors": len(ctc_head_named_params),
         "content_ctc_head_params": sum(param.numel() for param in ctc_head_named_params.values()),
         "content_ctc_head_lr_multiplier": float(content_ctc_head_lr_multiplier) if ctc_head_named_params else 1.0,
+        "ref_speaker_prompt_tensors": len(ref_speaker_prompt_named_params),
+        "ref_speaker_prompt_params": sum(param.numel() for param in ref_speaker_prompt_named_params.values()),
+        "ref_speaker_prompt_lr_multiplier": (
+            float(ref_speaker_prompt_lr_multiplier) if ref_speaker_prompt_named_params else 1.0
+        ),
     }
     if gate_named_params:
         for param in gate_named_params.values():
@@ -1452,6 +1644,14 @@ def build_optimizer_param_groups(
             {
                 "params": list(ctc_head_named_params.values()),
                 "lr": float(learning_rate) * float(content_ctc_head_lr_multiplier),
+                "weight_decay": float(weight_decay),
+            }
+        )
+    if use_ref_speaker_prompt_group:
+        param_groups.append(
+            {
+                "params": list(ref_speaker_prompt_named_params.values()),
+                "lr": float(learning_rate) * float(ref_speaker_prompt_lr_multiplier),
                 "weight_decay": float(weight_decay),
             }
         )
@@ -1505,6 +1705,207 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         float(args.speaker_loss_margin)
         if args.speaker_loss_margin is not None
         else float(deep_get(cfg, "loss.speaker_loss_margin", 0.0))
+    )
+    ref_speaker_prompt_tokens = (
+        int(args.ref_speaker_prompt_tokens)
+        if args.ref_speaker_prompt_tokens is not None
+        else int(deep_get(cfg, "model.ref_speaker_prompt_tokens", 0))
+    )
+    ref_speaker_prompt_dropout = (
+        float(args.ref_speaker_prompt_dropout)
+        if args.ref_speaker_prompt_dropout is not None
+        else float(deep_get(cfg, "model.ref_speaker_prompt_dropout", 0.0))
+    )
+    ref_speaker_prompt_mode = args.ref_speaker_prompt_mode or str(deep_get(cfg, "model.ref_speaker_prompt_mode", "memory"))
+    ref_speaker_prompt_token_source = args.ref_speaker_prompt_token_source or str(
+        deep_get(cfg, "model.ref_speaker_prompt_token_source", "speaker_mlp")
+    )
+    ref_speaker_prompt_slot = (
+        bool(args.ref_speaker_prompt_slot)
+        if args.ref_speaker_prompt_slot is not None
+        else bool(deep_get(cfg, "model.ref_speaker_prompt_slot", False))
+    )
+    ref_speaker_prompt_slot_code = (
+        int(args.ref_speaker_prompt_slot_code)
+        if args.ref_speaker_prompt_slot_code is not None
+        else int(deep_get(cfg, "model.ref_speaker_prompt_slot_code", -1))
+    )
+    ref_speaker_prompt_slot_pack_mode = args.ref_speaker_prompt_slot_pack_mode or str(
+        deep_get(cfg, "model.ref_speaker_prompt_slot_pack_mode", "pad")
+    )
+    ref_speaker_prompt_output_norm = (
+        bool(args.ref_speaker_prompt_output_norm)
+        if args.ref_speaker_prompt_output_norm is not None
+        else bool(deep_get(cfg, "model.ref_speaker_prompt_output_norm", False))
+    )
+    ref_speaker_prompt_output_scale = (
+        float(args.ref_speaker_prompt_output_scale)
+        if args.ref_speaker_prompt_output_scale is not None
+        else float(deep_get(cfg, "model.ref_speaker_prompt_output_scale", 1.0))
+    )
+    ref_prompt_codec_permutation_enabled = (
+        bool(args.ref_prompt_codec_permutation)
+        if args.ref_prompt_codec_permutation is not None
+        else bool(deep_get(cfg, "data.ref_prompt_codec_permutation_enabled", False))
+    )
+    ref_prompt_codec_permutation_min_seconds = (
+        float(args.ref_prompt_codec_permutation_min_seconds)
+        if args.ref_prompt_codec_permutation_min_seconds is not None
+        else float(deep_get(cfg, "data.ref_prompt_codec_permutation_min_seconds", 2.0))
+    )
+    ref_prompt_codec_permutation_max_seconds = (
+        float(args.ref_prompt_codec_permutation_max_seconds)
+        if args.ref_prompt_codec_permutation_max_seconds is not None
+        else float(deep_get(cfg, "data.ref_prompt_codec_permutation_max_seconds", 4.0))
+    )
+    ref_prompt_codec_permutation_frame_rate = (
+        float(args.ref_prompt_codec_permutation_frame_rate)
+        if args.ref_prompt_codec_permutation_frame_rate is not None
+        else float(deep_get(cfg, "data.ref_prompt_codec_permutation_frame_rate", 12.5))
+    )
+    ref_prompt_codec_permutation_seed = (
+        int(args.ref_prompt_codec_permutation_seed)
+        if args.ref_prompt_codec_permutation_seed is not None
+        else int(deep_get(cfg, "data.ref_prompt_codec_permutation_seed", 1234))
+    )
+    ref_prompt_codec_permutation_mode = args.ref_prompt_codec_permutation_mode or str(
+        deep_get(cfg, "data.ref_prompt_codec_permutation_mode", "shuffle")
+    )
+    ref_prompt_codec_permutation_block_seconds = (
+        float(args.ref_prompt_codec_permutation_block_seconds)
+        if args.ref_prompt_codec_permutation_block_seconds is not None
+        else float(deep_get(cfg, "data.ref_prompt_codec_permutation_block_seconds", 0.4))
+    )
+    target_front_ce_weight = (
+        float(args.target_front_ce_weight)
+        if args.target_front_ce_weight is not None
+        else float(deep_get(cfg, "loss.target_front_ce_weight", 1.0))
+    )
+    target_front_ce_seconds = (
+        float(args.target_front_ce_seconds)
+        if args.target_front_ce_seconds is not None
+        else float(deep_get(cfg, "loss.target_front_ce_seconds", 0.0))
+    )
+    target_front_ce_frame_rate = (
+        float(args.target_front_ce_frame_rate)
+        if args.target_front_ce_frame_rate is not None
+        else float(deep_get(cfg, "loss.target_front_ce_frame_rate", 12.5))
+    )
+    ref_speaker_adaln_weight = (
+        float(args.ref_speaker_adaln_weight)
+        if args.ref_speaker_adaln_weight is not None
+        else float(deep_get(cfg, "model.ref_speaker_adaln_weight", 0.0))
+    )
+    speaker_infonce_weight = (
+        float(args.speaker_infonce_weight)
+        if args.speaker_infonce_weight is not None
+        else float(deep_get(cfg, "loss.speaker_infonce_weight", 0.0))
+    )
+    speaker_infonce_temperature = (
+        float(args.speaker_infonce_temperature)
+        if args.speaker_infonce_temperature is not None
+        else float(deep_get(cfg, "loss.speaker_infonce_temperature", 0.07))
+    )
+    speaker_infonce_negative_pool_size = (
+        int(args.speaker_infonce_negative_pool_size)
+        if args.speaker_infonce_negative_pool_size is not None
+        else int(deep_get(cfg, "loss.speaker_infonce_negative_pool_size", 0))
+    )
+    speaker_infonce_negative_pool_seed = (
+        int(args.speaker_infonce_negative_pool_seed)
+        if args.speaker_infonce_negative_pool_seed is not None
+        else int(deep_get(cfg, "loss.speaker_infonce_negative_pool_seed", 1234))
+    )
+    speaker_condition_dropout = (
+        float(args.speaker_condition_dropout)
+        if args.speaker_condition_dropout is not None
+        else float(deep_get(cfg, "model.speaker_condition_dropout", 0.0))
+    )
+    speaker_side_pathway_enabled = (
+        bool(args.enable_speaker_side_pathway)
+        if args.enable_speaker_side_pathway is not None
+        else bool(deep_get(cfg, "model.speaker_side_pathway.enabled", False))
+    )
+    speaker_side_pathway_layers = args.speaker_side_pathway_layers or deep_get(
+        cfg,
+        "model.speaker_side_pathway.layers",
+        "all",
+    )
+    speaker_side_pathway_kv_bias = (
+        bool(args.speaker_side_pathway_kv_bias)
+        if args.speaker_side_pathway_kv_bias is not None
+        else bool(deep_get(cfg, "model.speaker_side_pathway.kv_bias", True))
+    )
+    speaker_side_pathway_gate_init = (
+        float(args.speaker_side_pathway_gate_init)
+        if args.speaker_side_pathway_gate_init is not None
+        else float(deep_get(cfg, "model.speaker_side_pathway.gate_init", 0.0))
+    )
+    speaker_side_pathway_dropout = (
+        float(args.speaker_side_pathway_dropout)
+        if args.speaker_side_pathway_dropout is not None
+        else float(deep_get(cfg, "model.speaker_side_pathway.dropout", 0.15))
+    )
+    speaker_cross_attn_enabled = (
+        bool(args.enable_speaker_cross_attn)
+        if args.enable_speaker_cross_attn is not None
+        else bool(deep_get(cfg, "model.speaker_cross_attn.enabled", False))
+    )
+    speaker_cross_attn_layers = args.speaker_cross_attn_layers or deep_get(
+        cfg,
+        "model.speaker_cross_attn.layers",
+        "all",
+    )
+    speaker_cross_attn_tokens = (
+        int(args.speaker_cross_attn_tokens)
+        if args.speaker_cross_attn_tokens is not None
+        else int(deep_get(cfg, "model.speaker_cross_attn.tokens", 8 if speaker_cross_attn_enabled else 0))
+    )
+    speaker_cross_attn_gate_init = (
+        float(args.speaker_cross_attn_gate_init)
+        if args.speaker_cross_attn_gate_init is not None
+        else float(deep_get(cfg, "model.speaker_cross_attn.gate_init", 0.0))
+    )
+    speaker_cross_attn_dropout = (
+        float(args.speaker_cross_attn_dropout)
+        if args.speaker_cross_attn_dropout is not None
+        else float(deep_get(cfg, "model.speaker_cross_attn.dropout", 0.0))
+    )
+    speaker_cross_attn_output_scale = (
+        float(args.speaker_cross_attn_output_scale)
+        if args.speaker_cross_attn_output_scale is not None
+        else float(deep_get(cfg, "model.speaker_cross_attn.output_scale", 1.0))
+    )
+    speaker_cross_attn_token_init_std = (
+        float(args.speaker_cross_attn_token_init_std)
+        if args.speaker_cross_attn_token_init_std is not None
+        else deep_get(cfg, "model.speaker_cross_attn.token_init_std", None)
+    )
+    if speaker_cross_attn_token_init_std is not None:
+        speaker_cross_attn_token_init_std = float(speaker_cross_attn_token_init_std)
+    speaker_cross_attn_alpha_warmup_steps = (
+        int(args.speaker_cross_attn_alpha_warmup_steps)
+        if args.speaker_cross_attn_alpha_warmup_steps is not None
+        else int(deep_get(cfg, "model.speaker_cross_attn.alpha_warmup_steps", 0))
+    )
+    speaker_cross_attn_source = args.speaker_cross_attn_source or str(
+        deep_get(cfg, "model.speaker_cross_attn.source", "vector")
+    )
+    speaker_cross_attn_seq_dim = (
+        int(args.speaker_cross_attn_seq_dim)
+        if args.speaker_cross_attn_seq_dim is not None
+        else int(deep_get(cfg, "model.speaker_cross_attn.seq_dim", 0))
+    )
+    if speaker_side_pathway_enabled or speaker_cross_attn_enabled:
+        enabled = True
+    legacy_timbre_memory_enabled = bool(args.use_timbre_memory) and int(tokens) > 0 and bool(str(layers).strip())
+    if not legacy_timbre_memory_enabled:
+        tokens = 0
+        layers = ""
+    use_perturbed_source_prompt = (
+        bool(args.use_perturbed_source_prompt)
+        if args.use_perturbed_source_prompt is not None
+        else bool(deep_get(cfg, "data.use_perturbed_source_prompt", False))
     )
     use_role_routing = bool(deep_get(cfg, "model.use_role_routing", False))
     if args.version == "ver2":
@@ -1664,11 +2065,14 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         if args.source_semantic_feature_dim is not None
         else int(deep_get(cfg, "source_semantic_memory.input_dim", 768))
     )
-    source_semantic_adapter_layers = args.source_semantic_adapter_layers or deep_get(
-        cfg,
-        "source_semantic_memory.selected_layers",
-        "28,30,32,34,35",
-    )
+    if source_semantic_memory_enabled:
+        source_semantic_adapter_layers = args.source_semantic_adapter_layers or deep_get(
+            cfg,
+            "source_semantic_memory.selected_layers",
+            "28,30,32,34,35",
+        )
+    else:
+        source_semantic_adapter_layers = ""
     source_semantic_no_text_gate = (
         float(args.source_semantic_no_text_gate)
         if args.source_semantic_no_text_gate is not None
@@ -1833,6 +2237,47 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         or str(deep_get(cfg, "model.speaker_encoder_type", "embedding_loader")),
         speaker_encoder_path=args.speaker_encoder_path or deep_get(cfg, "model.speaker_encoder_path", None),
         freeze_speaker_encoder=bool(deep_get(cfg, "model.freeze_speaker_encoder", True)),
+        ref_speaker_prompt_tokens=ref_speaker_prompt_tokens,
+        ref_speaker_prompt_dropout=ref_speaker_prompt_dropout,
+        ref_speaker_prompt_mode=ref_speaker_prompt_mode,
+        ref_speaker_prompt_token_source=ref_speaker_prompt_token_source,
+        ref_speaker_prompt_slot=ref_speaker_prompt_slot,
+        ref_speaker_prompt_slot_code=ref_speaker_prompt_slot_code,
+        ref_speaker_prompt_slot_pack_mode=ref_speaker_prompt_slot_pack_mode,
+        ref_speaker_prompt_output_norm=ref_speaker_prompt_output_norm,
+        ref_speaker_prompt_output_scale=ref_speaker_prompt_output_scale,
+        ref_prompt_codec_permutation_enabled=ref_prompt_codec_permutation_enabled,
+        ref_prompt_codec_permutation_min_seconds=ref_prompt_codec_permutation_min_seconds,
+        ref_prompt_codec_permutation_max_seconds=ref_prompt_codec_permutation_max_seconds,
+        ref_prompt_codec_permutation_frame_rate=ref_prompt_codec_permutation_frame_rate,
+        ref_prompt_codec_permutation_seed=ref_prompt_codec_permutation_seed,
+        ref_prompt_codec_permutation_mode=ref_prompt_codec_permutation_mode,
+        ref_prompt_codec_permutation_block_seconds=ref_prompt_codec_permutation_block_seconds,
+        target_front_ce_weight=target_front_ce_weight,
+        target_front_ce_seconds=target_front_ce_seconds,
+        target_front_ce_frame_rate=target_front_ce_frame_rate,
+        ref_speaker_adaln_weight=ref_speaker_adaln_weight,
+        speaker_infonce_weight=speaker_infonce_weight,
+        speaker_infonce_temperature=speaker_infonce_temperature,
+        speaker_infonce_negative_pool_size=speaker_infonce_negative_pool_size,
+        speaker_infonce_negative_pool_seed=speaker_infonce_negative_pool_seed,
+        speaker_condition_dropout=speaker_condition_dropout,
+        speaker_side_pathway_enabled=speaker_side_pathway_enabled,
+        speaker_side_pathway_layers=speaker_side_pathway_layers,
+        speaker_side_pathway_kv_bias=speaker_side_pathway_kv_bias,
+        speaker_side_pathway_gate_init=speaker_side_pathway_gate_init,
+        speaker_side_pathway_dropout=speaker_side_pathway_dropout,
+        speaker_cross_attn_enabled=speaker_cross_attn_enabled,
+        speaker_cross_attn_layers=speaker_cross_attn_layers,
+        speaker_cross_attn_tokens=speaker_cross_attn_tokens,
+        speaker_cross_attn_gate_init=speaker_cross_attn_gate_init,
+        speaker_cross_attn_dropout=speaker_cross_attn_dropout,
+        speaker_cross_attn_output_scale=speaker_cross_attn_output_scale,
+        speaker_cross_attn_token_init_std=speaker_cross_attn_token_init_std,
+        speaker_cross_attn_alpha_warmup_steps=speaker_cross_attn_alpha_warmup_steps,
+        speaker_cross_attn_source=speaker_cross_attn_source,
+        speaker_cross_attn_seq_dim=speaker_cross_attn_seq_dim,
+        use_perturbed_source_prompt=use_perturbed_source_prompt,
         use_role_routing=use_role_routing,
         route_loss_weight=route_loss_weight,
         prosody_memory_tokens=prosody_memory_tokens,
@@ -1956,7 +2401,69 @@ def timbre_adapter_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
             and "role_router" not in name
             and "source_prosody_encoder" not in name
             and "target_head_router" not in name
+            and "speaker_side_adaln" not in name
+            and "speaker_side_kv_bias" not in name
+            and "speaker_side_gate_logits" not in name
+            and "speaker_cross_attn_tokens" not in name
+            and "speaker_cross_attn_seq_projector" not in name
+            and "speaker_cross_attn_layers" not in name
+            and "null_speaker_embedding" not in name
         ) or param.grad is None:
+            continue
+        grad = param.grad.detach().float()
+        norm = grad.norm(2).item()
+        total_norm_sq += norm * norm
+        has_nonzero = has_nonzero or torch.count_nonzero(grad).item() > 0
+    return math.sqrt(total_norm_sq), has_nonzero
+
+
+def named_fragment_grad_stats(model: torch.nn.Module, fragments: tuple[str, ...]) -> tuple[float, bool]:
+    total_norm_sq = 0.0
+    has_nonzero = False
+    for name, param in model.named_parameters():
+        if param.grad is None or not any(fragment in name for fragment in fragments):
+            continue
+        grad = param.grad.detach().float()
+        norm = grad.norm(2).item()
+        total_norm_sq += norm * norm
+        has_nonzero = has_nonzero or torch.count_nonzero(grad).item() > 0
+    return math.sqrt(total_norm_sq), has_nonzero
+
+
+def _extract_layer_after_fragment(name: str, fragment: str) -> str | None:
+    if fragment not in name:
+        return None
+    tail = name.split(fragment, 1)[1].lstrip("._")
+    for token in tail.split("."):
+        if token.isdigit():
+            return token
+    return None
+
+
+def named_fragment_layer_grad_norms(model: torch.nn.Module, fragment: str) -> dict[str, float]:
+    per_layer: dict[str, float] = {}
+    for name, param in model.named_parameters():
+        if fragment not in name or param.grad is None:
+            continue
+        layer = _extract_layer_after_fragment(name, fragment)
+        if layer is None:
+            continue
+        grad = param.grad.detach().float()
+        norm = float(torch.linalg.vector_norm(grad).item())
+        per_layer[layer] = per_layer.get(layer, 0.0) + norm * norm
+    return {layer: math.sqrt(total_sq) for layer, total_sq in per_layer.items()}
+
+
+def merge_max_norms(dst: dict[str, float], src: dict[str, float]) -> None:
+    for layer, value in src.items():
+        dst[layer] = max(float(dst.get(layer, 0.0)), float(value))
+
+
+def ref_speaker_prompt_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
+    total_norm_sq = 0.0
+    has_nonzero = False
+    for name, param in model.named_parameters():
+        if "ref_speaker_prompt" not in name or param.grad is None:
             continue
         grad = param.grad.detach().float()
         norm = grad.norm(2).item()
@@ -1989,6 +2496,32 @@ def source_semantic_gate_grad_stats(model: torch.nn.Module) -> tuple[float, bool
         total_norm_sq += norm * norm
         has_nonzero = has_nonzero or torch.count_nonzero(grad).item() > 0
     return math.sqrt(total_norm_sq), has_nonzero
+
+
+def speaker_cross_attn_gate_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
+    total_norm_sq = 0.0
+    has_nonzero = False
+    for name, param in model.named_parameters():
+        if "speaker_cross_attn_layers" not in name or not name.endswith(".gate_logit") or param.grad is None:
+            continue
+        grad = param.grad.detach().float()
+        norm = grad.norm(2).item()
+        total_norm_sq += norm * norm
+        has_nonzero = has_nonzero or torch.count_nonzero(grad).item() > 0
+    return math.sqrt(total_norm_sq), has_nonzero
+
+
+def speaker_cross_attn_gate_layer_grad_norms(model: torch.nn.Module) -> dict[str, float]:
+    per_layer: dict[str, float] = {}
+    for name, param in model.named_parameters():
+        if "speaker_cross_attn_layers" not in name or not name.endswith(".gate_logit") or param.grad is None:
+            continue
+        layer = _extract_layer_after_fragment(name, "speaker_cross_attn_layers")
+        if layer is None:
+            continue
+        grad = param.grad.detach().float()
+        per_layer[layer] = float(torch.linalg.vector_norm(grad).item())
+    return per_layer
 
 
 def source_semantic_trainable_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
@@ -2068,6 +2601,142 @@ def capture_source_semantic_gate_snapshot(model: torch.nn.Module) -> dict[str, t
         if is_source_semantic_gate_param_name(name):
             snapshot[name] = param.detach().float().cpu().clone()
     return snapshot
+
+
+def capture_speaker_side_initial_snapshot(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    snapshot: dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        if (
+            "speaker_side_adaln" in name
+            or "speaker_side_kv_bias" in name
+            or "speaker_side_gate_logits" in name
+            or "speaker_cross_attn_tokens" in name
+            or "speaker_cross_attn_seq_projector" in name
+            or "speaker_cross_attn_layers" in name
+            or "null_speaker_embedding" in name
+        ):
+            snapshot[name] = param.detach().float().cpu().clone()
+    return snapshot
+
+
+def speaker_side_gate_values(model: torch.nn.Module) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for name, param in model.named_parameters():
+        layer = _extract_layer_after_fragment(name, "speaker_side_gate_logits")
+        if layer is None:
+            continue
+        values[layer] = float(torch.sigmoid(param.detach().float()).mean().cpu().item())
+    return values
+
+
+def speaker_cross_attn_gate_values(model: torch.nn.Module) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for name, param in model.named_parameters():
+        if "speaker_cross_attn_layers" not in name or not name.endswith(".gate_logit"):
+            continue
+        layer = _extract_layer_after_fragment(name, "speaker_cross_attn_layers")
+        if layer is None:
+            continue
+        values[layer] = float(torch.sigmoid(param.detach().float()).mean().cpu().item())
+    return values
+
+
+def summarize_gate_values(values: dict[str, float]) -> dict[str, Any]:
+    gate_tensor = torch.tensor(list(values.values()), dtype=torch.float32) if values else torch.empty(0)
+    if gate_tensor.numel() <= 0:
+        return {"num_layers": 0}
+    hist = torch.histc(gate_tensor, bins=10, min=0.0, max=1.0).to(dtype=torch.int64).tolist()
+    return {
+        "num_layers": int(gate_tensor.numel()),
+        "mean": float(gate_tensor.mean().item()),
+        "std": float(gate_tensor.std(unbiased=False).item()) if gate_tensor.numel() > 1 else 0.0,
+        "min": float(gate_tensor.min().item()),
+        "max": float(gate_tensor.max().item()),
+        "histogram_bins_0_1_count10": [int(x) for x in hist],
+    }
+
+
+def speaker_side_adaln_drift_stats(
+    model: torch.nn.Module,
+    initial_snapshot: dict[str, torch.Tensor],
+) -> dict[str, dict[str, float]]:
+    per_layer: dict[str, dict[str, float]] = {}
+    for name, param in model.named_parameters():
+        if "speaker_side_adaln" not in name or name not in initial_snapshot:
+            continue
+        layer = _extract_layer_after_fragment(name, "speaker_side_adaln")
+        if layer is None:
+            continue
+        current = param.detach().float().cpu()
+        initial = initial_snapshot[name].float()
+        diff = current - initial
+        row = per_layer.setdefault(
+            layer,
+            {
+                "param_l2_drift_sq": 0.0,
+                "shift_head_l2_drift_sq": 0.0,
+                "scale_head_l2_drift_sq": 0.0,
+                "param_tensors": 0.0,
+            },
+        )
+        row["param_l2_drift_sq"] += float(diff.pow(2).sum().item())
+        row["param_tensors"] += 1.0
+        tail = name.split("speaker_side_adaln", 1)[1]
+        if ".3." in tail and diff.shape and int(diff.shape[0]) % 2 == 0:
+            half = int(diff.shape[0]) // 2
+            row["shift_head_l2_drift_sq"] += float(diff[:half].pow(2).sum().item())
+            row["scale_head_l2_drift_sq"] += float(diff[half:].pow(2).sum().item())
+    out: dict[str, dict[str, float]] = {}
+    for layer, row in per_layer.items():
+        out[layer] = {
+            "param_l2_drift": math.sqrt(float(row["param_l2_drift_sq"])),
+            "shift_head_l2_drift": math.sqrt(float(row["shift_head_l2_drift_sq"])),
+            "scale_head_l2_drift": math.sqrt(float(row["scale_head_l2_drift_sq"])),
+            "param_tensors": int(row["param_tensors"]),
+        }
+    return out
+
+
+def write_ver29_smoke_train_diagnostics(
+    output_dir: Path,
+    model: torch.nn.Module,
+    *,
+    initial_snapshot: dict[str, torch.Tensor],
+    max_grad_norms: dict[str, dict[str, float]],
+    global_step: int,
+) -> None:
+    gate_values = speaker_side_gate_values(model)
+    gate_summary = summarize_gate_values(gate_values)
+    cross_gate_values = speaker_cross_attn_gate_values(model)
+    cross_gate_summary = summarize_gate_values(cross_gate_values)
+    payload = {
+        "global_step": int(global_step),
+        "speaker_side_gate_by_layer": {k: gate_values[k] for k in sorted(gate_values, key=lambda x: int(x))},
+        "speaker_side_gate_summary": gate_summary,
+        "speaker_cross_attn_gate_by_layer": {
+            k: cross_gate_values[k] for k in sorted(cross_gate_values, key=lambda x: int(x))
+        },
+        "speaker_cross_attn_gate_summary": cross_gate_summary,
+        "speaker_side_max_grad_norm_by_layer": {
+            group: {k: float(values[k]) for k in sorted(values, key=lambda x: int(x))}
+            for group, values in max_grad_norms.items()
+        },
+        "speaker_side_adaln_drift_by_layer": {
+            k: v for k, v in sorted(
+                speaker_side_adaln_drift_stats(model, initial_snapshot).items(),
+                key=lambda item: int(item[0]),
+            )
+        },
+        "null_speaker_embedding_l2": None,
+        "progress_stop_aux_stats_last_batch": getattr(model, "last_progress_stop_aux_stats", {}) or {},
+    }
+    for name, param in model.named_parameters():
+        if name.endswith("null_speaker_embedding"):
+            payload["null_speaker_embedding_l2"] = float(torch.linalg.vector_norm(param.detach().float()).cpu().item())
+            break
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "ver2_9_smoke_train_diagnostics.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
 
 
 def source_semantic_gate_delta_stats(
@@ -2151,15 +2820,31 @@ def scheduled_speaker_aux_weights(
     final_source_suppression_weight: float,
     warmup_steps: int,
     warmup_weight: float,
+    schedule: str = "step",
 ) -> tuple[float, float, bool]:
     if int(warmup_steps) <= 0 or int(step) >= int(warmup_steps):
         return float(final_speaker_weight), float(final_source_suppression_weight), False
-    speaker_weight = min(float(warmup_weight), float(final_speaker_weight)) if final_speaker_weight > 0 else 0.0
-    source_suppression_weight = (
-        min(float(warmup_weight), float(final_source_suppression_weight))
-        if final_source_suppression_weight > 0
-        else 0.0
-    )
+    start_weight = max(0.0, float(warmup_weight))
+    mode = str(schedule or "step").strip().lower()
+    if mode == "cosine":
+        progress = max(0.0, min(1.0, float(step) / max(1.0, float(warmup_steps))))
+        alpha = 0.5 - 0.5 * math.cos(math.pi * progress)
+
+        def ramp(final_weight: float) -> float:
+            if final_weight <= 0:
+                return 0.0
+            start = min(start_weight, float(final_weight))
+            return start + (float(final_weight) - start) * alpha
+
+        speaker_weight = ramp(float(final_speaker_weight))
+        source_suppression_weight = ramp(float(final_source_suppression_weight))
+    else:
+        speaker_weight = min(start_weight, float(final_speaker_weight)) if final_speaker_weight > 0 else 0.0
+        source_suppression_weight = (
+            min(start_weight, float(final_source_suppression_weight))
+            if final_source_suppression_weight > 0
+            else 0.0
+        )
     return speaker_weight, source_suppression_weight, True
 
 
@@ -2241,11 +2926,16 @@ def build_forward_kwargs_from_batch(
             "target_position_mask": batch["target_assistant_positions"],
             "source_prompt_positions": batch["source_prompt_positions"],
             "timbre_ref_prompt_positions": batch["timbre_ref_prompt_positions"],
+            "ref_speaker_prompt_slot_positions": batch.get("ref_speaker_prompt_slot_positions"),
             "role_ids": batch.get("role_ids"),
             "vc_mode_id": batch["vc_mode_id"],
             "source_speaker_embedding_path": batch.get("source_speaker_embedding_path"),
             "timbre_ref_speaker_embedding_path": batch.get("timbre_ref_speaker_embedding_path"),
             "target_speaker_embedding_path": batch.get("target_speaker_embedding_path"),
+            "speaker_vec_path": batch.get("speaker_vec_path"),
+            "speaker_seq_path": batch.get("speaker_seq_path"),
+            "speaker_seq_features": batch.get("speaker_seq_features"),
+            "speaker_seq_features_mask": batch.get("speaker_seq_features_mask"),
             "source_speaker_audio_path": batch.get("source_speaker_audio_path"),
             "timbre_ref_speaker_audio_path": batch.get("timbre_ref_speaker_audio_path"),
             "target_speaker_audio_path": batch.get("target_speaker_audio_path"),
@@ -2282,6 +2972,7 @@ def collect_aux_loss_scalars(model: torch.nn.Module) -> dict[str, float | None]:
         "last_ref_content_suppression_stats",
         "last_progress_stop_aux_stats",
         "last_route_stats",
+        "last_speaker_side_stats",
     ):
         stats = getattr(model, attr, None) or {}
         if not isinstance(stats, dict):
@@ -2311,6 +3002,13 @@ def main() -> int:
         if args.speaker_loss_warmup_weight is not None
         else float(deep_get(cfg, "loss.speaker_loss_warmup_weight", 0.02))
     )
+    speaker_loss_schedule = str(
+        args.speaker_loss_schedule
+        if args.speaker_loss_schedule is not None
+        else deep_get(cfg, "loss.speaker_loss_schedule", "step")
+    ).strip().lower()
+    if speaker_loss_schedule not in {"step", "cosine"}:
+        raise ValueError(f"unsupported speaker_loss_schedule: {speaker_loss_schedule!r}")
     if final_target_speaker_similarity_weight <= 0 and final_source_speaker_suppression_weight <= 0:
         speaker_loss_warmup_steps = 0
     if args.gradient_checkpointing and timbre_memory_config.enabled:
@@ -2320,7 +3018,9 @@ def main() -> int:
             flush=True,
         )
         args.gradient_checkpointing = False
-    args.use_timbre_memory = timbre_memory_config.enabled
+    args.use_timbre_memory = bool(
+        int(timbre_memory_config.num_memory_tokens) > 0 and str(timbre_memory_config.adapter_layers).strip()
+    )
     args.timbre_memory_tokens = timbre_memory_config.num_memory_tokens
     args.timbre_adapter_layers = timbre_memory_config.adapter_layers
     args.timbre_adapter_heads = timbre_memory_config.num_heads
@@ -2338,6 +3038,47 @@ def main() -> int:
     args.freeze_speaker_encoder = timbre_memory_config.freeze_speaker_encoder
     args.target_speaker_similarity_weight = timbre_memory_config.target_speaker_similarity_weight
     args.source_speaker_suppression_weight = timbre_memory_config.source_speaker_suppression_weight
+    args.ref_speaker_prompt_tokens = timbre_memory_config.ref_speaker_prompt_tokens
+    args.ref_speaker_prompt_dropout = timbre_memory_config.ref_speaker_prompt_dropout
+    args.ref_speaker_prompt_mode = timbre_memory_config.ref_speaker_prompt_mode
+    args.ref_speaker_prompt_token_source = timbre_memory_config.ref_speaker_prompt_token_source
+    args.ref_speaker_prompt_slot = timbre_memory_config.ref_speaker_prompt_slot
+    args.ref_speaker_prompt_slot_code = timbre_memory_config.ref_speaker_prompt_slot_code
+    args.ref_speaker_prompt_slot_pack_mode = timbre_memory_config.ref_speaker_prompt_slot_pack_mode
+    args.ref_speaker_prompt_output_norm = timbre_memory_config.ref_speaker_prompt_output_norm
+    args.ref_speaker_prompt_output_scale = timbre_memory_config.ref_speaker_prompt_output_scale
+    args.ref_prompt_codec_permutation = timbre_memory_config.ref_prompt_codec_permutation_enabled
+    args.ref_prompt_codec_permutation_min_seconds = timbre_memory_config.ref_prompt_codec_permutation_min_seconds
+    args.ref_prompt_codec_permutation_max_seconds = timbre_memory_config.ref_prompt_codec_permutation_max_seconds
+    args.ref_prompt_codec_permutation_frame_rate = timbre_memory_config.ref_prompt_codec_permutation_frame_rate
+    args.ref_prompt_codec_permutation_seed = timbre_memory_config.ref_prompt_codec_permutation_seed
+    args.ref_prompt_codec_permutation_mode = timbre_memory_config.ref_prompt_codec_permutation_mode
+    args.ref_prompt_codec_permutation_block_seconds = timbre_memory_config.ref_prompt_codec_permutation_block_seconds
+    args.target_front_ce_weight = timbre_memory_config.target_front_ce_weight
+    args.target_front_ce_seconds = timbre_memory_config.target_front_ce_seconds
+    args.target_front_ce_frame_rate = timbre_memory_config.target_front_ce_frame_rate
+    args.ref_speaker_adaln_weight = timbre_memory_config.ref_speaker_adaln_weight
+    args.speaker_infonce_weight = timbre_memory_config.speaker_infonce_weight
+    args.speaker_infonce_temperature = timbre_memory_config.speaker_infonce_temperature
+    args.speaker_infonce_negative_pool_size = timbre_memory_config.speaker_infonce_negative_pool_size
+    args.speaker_infonce_negative_pool_seed = timbre_memory_config.speaker_infonce_negative_pool_seed
+    args.speaker_condition_dropout = timbre_memory_config.speaker_condition_dropout
+    args.enable_speaker_side_pathway = timbre_memory_config.speaker_side_pathway_enabled
+    args.speaker_side_pathway_layers = timbre_memory_config.speaker_side_pathway_layers
+    args.speaker_side_pathway_kv_bias = timbre_memory_config.speaker_side_pathway_kv_bias
+    args.speaker_side_pathway_gate_init = timbre_memory_config.speaker_side_pathway_gate_init
+    args.speaker_side_pathway_dropout = timbre_memory_config.speaker_side_pathway_dropout
+    args.enable_speaker_cross_attn = timbre_memory_config.speaker_cross_attn_enabled
+    args.speaker_cross_attn_layers = timbre_memory_config.speaker_cross_attn_layers
+    args.speaker_cross_attn_tokens = timbre_memory_config.speaker_cross_attn_tokens
+    args.speaker_cross_attn_gate_init = timbre_memory_config.speaker_cross_attn_gate_init
+    args.speaker_cross_attn_dropout = timbre_memory_config.speaker_cross_attn_dropout
+    args.speaker_cross_attn_output_scale = timbre_memory_config.speaker_cross_attn_output_scale
+    args.speaker_cross_attn_token_init_std = timbre_memory_config.speaker_cross_attn_token_init_std
+    args.speaker_cross_attn_alpha_warmup_steps = timbre_memory_config.speaker_cross_attn_alpha_warmup_steps
+    args.speaker_cross_attn_source = timbre_memory_config.speaker_cross_attn_source
+    args.speaker_cross_attn_seq_dim = timbre_memory_config.speaker_cross_attn_seq_dim
+    args.use_perturbed_source_prompt = timbre_memory_config.use_perturbed_source_prompt
     args.speaker_loss_warmup_steps = speaker_loss_warmup_steps
     args.speaker_loss_warmup_weight = speaker_loss_warmup_weight
     args.enable_role_routing = timbre_memory_config.use_role_routing
@@ -2504,19 +3245,39 @@ def main() -> int:
                 content_tokenizer=content_tokenizer,
                 content_ctc_token_offset=timbre_memory_config.content_ctc_token_offset,
                 timbre_side_only=bool(args.timbre_side_only),
+                use_perturbed_source_prompt=bool(timbre_memory_config.use_perturbed_source_prompt),
+                ref_speaker_prompt_slot=bool(timbre_memory_config.ref_speaker_prompt_slot),
+                ref_speaker_prompt_tokens=int(timbre_memory_config.ref_speaker_prompt_tokens),
+                ref_speaker_prompt_slot_code=int(timbre_memory_config.ref_speaker_prompt_slot_code),
+                ref_speaker_prompt_slot_pack_mode=str(timbre_memory_config.ref_speaker_prompt_slot_pack_mode),
+                ref_prompt_codec_permutation_enabled=bool(timbre_memory_config.ref_prompt_codec_permutation_enabled),
+                ref_prompt_codec_permutation_min_seconds=float(
+                    timbre_memory_config.ref_prompt_codec_permutation_min_seconds
+                ),
+                ref_prompt_codec_permutation_max_seconds=float(
+                    timbre_memory_config.ref_prompt_codec_permutation_max_seconds
+                ),
+                ref_prompt_codec_permutation_frame_rate=float(
+                    timbre_memory_config.ref_prompt_codec_permutation_frame_rate
+                ),
+                ref_prompt_codec_permutation_mode=str(timbre_memory_config.ref_prompt_codec_permutation_mode),
+                ref_prompt_codec_permutation_block_seconds=float(
+                    timbre_memory_config.ref_prompt_codec_permutation_block_seconds
+                ),
+                speaker_side_pathway_enabled=bool(timbre_memory_config.speaker_side_pathway_enabled),
             )
         return base
 
     dataset = build_sft_dataset(records)
-    eval_records = load_eval_records(args)
-    eval_dataset = None
-    if eval_records is not None:
+    eval_record_sets = load_named_eval_records(args)
+    eval_datasets: list[tuple[str, Any]] = []
+    for eval_label, eval_records in eval_record_sets:
         validate_content_tokenizer_consistency(
             eval_records,
             enabled=timbre_memory_config.content_ctc_weight > 0,
             allow_mixed=bool(args.allow_mixed_content_tokenizers),
         )
-        eval_dataset = build_sft_dataset(eval_records)
+        eval_datasets.append((eval_label, build_sft_dataset(eval_records)))
     probe = dataset.collate_fn([dataset[0]])
     if (
         timbre_memory_config.enabled
@@ -2549,7 +3310,20 @@ def main() -> int:
         print(
             f"[pack] timbre_ref_codes={tuple(probe['timbre_ref_codes'].shape)} "
             f"target_positions={int(probe['target_assistant_positions'].sum().item())} "
+            f"slot_positions={int(probe.get('ref_speaker_prompt_slot_positions', torch.zeros(1)).sum().item())} "
             f"mode_ids={probe['vc_mode_id'].tolist()}"
+        )
+        print(
+            "[pack] speaker_prompt="
+            f"tokens={timbre_memory_config.ref_speaker_prompt_tokens} "
+            f"mode={timbre_memory_config.ref_speaker_prompt_mode} "
+            f"source={timbre_memory_config.ref_speaker_prompt_token_source} "
+            f"slot={timbre_memory_config.ref_speaker_prompt_slot} "
+            f"slot_code={timbre_memory_config.ref_speaker_prompt_slot_code} "
+            f"slot_pack={timbre_memory_config.ref_speaker_prompt_slot_pack_mode} "
+            f"output_norm={timbre_memory_config.ref_speaker_prompt_output_norm} "
+            f"output_scale={timbre_memory_config.ref_speaker_prompt_output_scale}",
+            flush=True,
         )
         print(
             "[pack] source_content_memory="
@@ -2571,6 +3345,20 @@ def main() -> int:
             f"source={timbre_memory_config.ref_content_suppression_source}",
             flush=True,
         )
+        if bool(timbre_memory_config.ref_prompt_codec_permutation_enabled):
+            prompt_perm = probe.get("timbre_ref_prompt_permutation")
+            prompt_perm_values = prompt_perm.tolist() if torch.is_tensor(prompt_perm) else None
+            print(
+                "[pack] ref_prompt_codec_permutation="
+                f"enabled={timbre_memory_config.ref_prompt_codec_permutation_enabled} "
+                f"seconds={timbre_memory_config.ref_prompt_codec_permutation_min_seconds:.3f}-"
+                f"{timbre_memory_config.ref_prompt_codec_permutation_max_seconds:.3f} "
+                f"frame_rate={timbre_memory_config.ref_prompt_codec_permutation_frame_rate:.3f} "
+                f"mode={timbre_memory_config.ref_prompt_codec_permutation_mode} "
+                f"block_seconds={timbre_memory_config.ref_prompt_codec_permutation_block_seconds:.3f} "
+                f"probe={prompt_perm_values}",
+                flush=True,
+            )
         print(
             "[pack] source_prosody_gates="
             f"no_text={timbre_memory_config.source_prosody_no_text_gate} "
@@ -2611,17 +3399,30 @@ def main() -> int:
             }
         if feature_shapes:
             print(f"[pack] auxiliary_features={feature_shapes}")
-    if eval_dataset is not None:
+    for eval_label, eval_dataset in eval_datasets:
         eval_probe = eval_dataset.collate_fn([eval_dataset[0]])
         print(
-            f"[eval-pack] records={len(eval_dataset)} input_ids={tuple(eval_probe["input_ids"].shape)} "
-            f"labels={tuple(eval_probe["labels"].shape)} valid_labels={int((eval_probe["labels"] != -100).sum().item())}"
+            f"[eval-pack:{eval_label}] records={len(eval_dataset)} input_ids={tuple(eval_probe['input_ids'].shape)} "
+            f"labels={tuple(eval_probe['labels'].shape)} valid_labels={int((eval_probe['labels'] != -100).sum().item())}"
         )
         if timbre_memory_config.enabled:
             print(
-                f"[eval-pack] timbre_ref_codes={tuple(eval_probe["timbre_ref_codes"].shape)} "
-                f"target_positions={int(eval_probe["target_assistant_positions"].sum().item())} "
-                f"mode_ids={eval_probe["vc_mode_id"].tolist()}"
+                f"[eval-pack:{eval_label}] timbre_ref_codes={tuple(eval_probe['timbre_ref_codes'].shape)} "
+                f"target_positions={int(eval_probe['target_assistant_positions'].sum().item())} "
+                f"slot_positions={int(eval_probe.get('ref_speaker_prompt_slot_positions', torch.zeros(1)).sum().item())} "
+                f"mode_ids={eval_probe['vc_mode_id'].tolist()}"
+            )
+            print(
+                f"[eval-pack:{eval_label}] speaker_prompt="
+                f"tokens={timbre_memory_config.ref_speaker_prompt_tokens} "
+                f"mode={timbre_memory_config.ref_speaker_prompt_mode} "
+                f"source={timbre_memory_config.ref_speaker_prompt_token_source} "
+                f"slot={timbre_memory_config.ref_speaker_prompt_slot} "
+                f"slot_code={timbre_memory_config.ref_speaker_prompt_slot_code} "
+                f"slot_pack={timbre_memory_config.ref_speaker_prompt_slot_pack_mode} "
+                f"output_norm={timbre_memory_config.ref_speaker_prompt_output_norm} "
+                f"output_scale={timbre_memory_config.ref_speaker_prompt_output_scale}",
+                flush=True,
             )
 
     if args.pack_only:
@@ -2668,6 +3469,30 @@ def main() -> int:
             model = MossCodecVCTimbreMemoryWrapper(model, timbre_memory_config)
         if resume_adapter_path is not None and isinstance(model, MossCodecVCTimbreMemoryWrapper):
             model.peft_adapter_fallback_directory = resume_adapter_path
+        if (
+            isinstance(model, MossCodecVCTimbreMemoryWrapper)
+            and float(timbre_memory_config.speaker_infonce_weight) > 0.0
+            and int(timbre_memory_config.speaker_infonce_negative_pool_size) > 0
+        ):
+            negative_paths = sample_timbre_ref_speaker_embedding_paths(
+                records,
+                pool_size=int(timbre_memory_config.speaker_infonce_negative_pool_size),
+                seed=int(timbre_memory_config.speaker_infonce_negative_pool_seed),
+            )
+            pool_stats = model.build_speaker_infonce_negative_pool(
+                negative_paths,
+                pool_size=int(timbre_memory_config.speaker_infonce_negative_pool_size),
+                seed=int(timbre_memory_config.speaker_infonce_negative_pool_seed),
+            )
+            if accelerator.is_main_process:
+                print(
+                    "[speaker_infonce_negative_pool] "
+                    f"sampled_paths={len(negative_paths)} "
+                    f"pool_size={int(pool_stats.get('speaker_infonce_negative_pool_size', 0.0))} "
+                    f"dim={int(pool_stats.get('speaker_infonce_negative_pool_dim', 0.0))} "
+                    f"seed={int(timbre_memory_config.speaker_infonce_negative_pool_seed)}",
+                    flush=True,
+                )
         trainable = collect_trainable_parameters(model)
     if model_dtype != torch.float32:
         cast_floating_state(model, model_dtype)
@@ -2726,8 +3551,8 @@ def main() -> int:
         collate_fn=dataset.collate_fn,
         drop_last=False,
     )
-    eval_loader = None
-    if eval_dataset is not None:
+    eval_loaders: list[tuple[str, Any]] = []
+    for eval_label, eval_dataset in eval_datasets:
         eval_loader = DataLoader(
             eval_dataset,
             batch_size=args.per_device_batch_size,
@@ -2736,6 +3561,7 @@ def main() -> int:
             collate_fn=eval_dataset.collate_fn,
             drop_last=False,
         )
+        eval_loaders.append((eval_label, eval_loader))
     optimizer_param_groups, optimizer_group_summary = build_optimizer_param_groups(
         model,
         learning_rate=args.learning_rate,
@@ -2745,6 +3571,7 @@ def main() -> int:
         source_semantic_gate_lr_multiplier=args.source_semantic_gate_lr_multiplier,
         content_ctc_head_lr_multiplier=args.content_ctc_head_lr_multiplier,
         timbre_adapter_gate_lr_multiplier=args.timbre_adapter_gate_lr_multiplier,
+        ref_speaker_prompt_lr_multiplier=args.ref_speaker_prompt_lr_multiplier,
     )
     optimizer = AdamW(optimizer_param_groups)
 
@@ -2755,7 +3582,7 @@ def main() -> int:
     )
     update_steps_per_epoch = math.ceil(len(dataset) / max(1, estimated_global_batch_size))
     max_train_steps = args.max_train_steps or args.num_epochs * update_steps_per_epoch
-    if args.smoke_test:
+    if args.smoke_test and int(args.max_train_steps or 0) <= 0:
         max_train_steps = min(max_train_steps, 2)
     effective_num_epochs = args.num_epochs
     if max_train_steps > 0 and update_steps_per_epoch > 0:
@@ -2767,22 +3594,28 @@ def main() -> int:
     scheduler_step_multiplier = 1 if getattr(accelerator, "split_batches", False) else max(1, int(accelerator.num_processes))
     scheduler_warmup_steps = warmup_steps * scheduler_step_multiplier
     scheduler_training_steps = max_train_steps * scheduler_step_multiplier
+    lr_scheduler_type = str(args.lr_scheduler_type or "cosine").strip().lower()
     lr_scheduler = get_scheduler(
-        "cosine",
+        lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=scheduler_warmup_steps,
         num_training_steps=scheduler_training_steps,
     )
     channelwise_loss_weight = parse_channelwise_loss_weight(args.channelwise_loss_weight, n_vq + 1)
 
-    if eval_loader is not None:
-        model, optimizer, train_loader, lr_scheduler, eval_loader = accelerator.prepare(
+    if eval_loaders:
+        prepared = accelerator.prepare(
             model,
             optimizer,
             train_loader,
             lr_scheduler,
-            eval_loader,
+            *(loader for _, loader in eval_loaders),
         )
+        model, optimizer, train_loader, lr_scheduler = prepared[:4]
+        eval_loaders = [
+            (label, loader)
+            for (label, _), loader in zip(eval_loaders, prepared[4:])
+        ]
     else:
         model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
             model,
@@ -2792,10 +3625,13 @@ def main() -> int:
         )
     routing_gate_initial_snapshot: dict[str, torch.Tensor] = {}
     source_semantic_gate_initial_snapshot: dict[str, torch.Tensor] = {}
+    speaker_side_initial_snapshot: dict[str, torch.Tensor] = {}
     if timbre_memory_config.enabled:
         unwrapped_after_prepare = accelerator.unwrap_model(model)
         routing_gate_initial_snapshot = capture_routing_gate_snapshot(unwrapped_after_prepare)
         source_semantic_gate_initial_snapshot = capture_source_semantic_gate_snapshot(unwrapped_after_prepare)
+        if bool(timbre_memory_config.speaker_side_pathway_enabled):
+            speaker_side_initial_snapshot = capture_speaker_side_initial_snapshot(unwrapped_after_prepare)
 
     if accelerator.is_main_process:
         output_dir = Path(args.output_dir)
@@ -2835,6 +3671,10 @@ def main() -> int:
             f"content_ctc_head_tensors={optimizer_group_summary['content_ctc_head_tensors']} "
             f"content_ctc_head_params={optimizer_group_summary['content_ctc_head_params']} "
             f"content_ctc_head_lr_multiplier={optimizer_group_summary['content_ctc_head_lr_multiplier']:.4g} "
+            f"ref_speaker_prompt_tensors={optimizer_group_summary['ref_speaker_prompt_tensors']} "
+            f"ref_speaker_prompt_params={optimizer_group_summary['ref_speaker_prompt_params']} "
+            f"ref_speaker_prompt_lr_multiplier={optimizer_group_summary['ref_speaker_prompt_lr_multiplier']:.4g} "
+            f"ref_speaker_prompt_lr={args.learning_rate * optimizer_group_summary['ref_speaker_prompt_lr_multiplier']:.4g} "
             f"routing_gate_lr_multiplier={args.routing_gate_lr_multiplier:.4g} "
             f"routing_gate_lr={args.learning_rate * args.routing_gate_lr_multiplier:.4g} "
             f"source_semantic_lr_multiplier={optimizer_group_summary['source_semantic_lr_multiplier']:.4g} "
@@ -2864,7 +3704,7 @@ def main() -> int:
         )
         print(
             "[lr_schedule] "
-            f"type=cosine "
+            f"type={lr_scheduler_type} "
             f"warmup_update_steps={warmup_steps} "
             f"scheduler_step_multiplier={scheduler_step_multiplier} "
             f"scheduler_warmup_steps={scheduler_warmup_steps} "
@@ -2873,10 +3713,47 @@ def main() -> int:
         if timbre_memory_config.enabled:
             print(
                 "[speaker_loss_schedule] "
+                f"type={speaker_loss_schedule} "
                 f"warmup_steps={speaker_loss_warmup_steps} "
                 f"warmup_weight={speaker_loss_warmup_weight:.4f} "
                 f"final_ref_weight={final_target_speaker_similarity_weight:.4f} "
                 f"final_srcsup_weight={final_source_speaker_suppression_weight:.4f}"
+            )
+            print(
+                "[speaker_timbre_repair] "
+                f"ref_prompt_tokens={timbre_memory_config.ref_speaker_prompt_tokens} "
+                f"ref_prompt_dropout={timbre_memory_config.ref_speaker_prompt_dropout:.4f} "
+                f"ref_prompt_mode={timbre_memory_config.ref_speaker_prompt_mode} "
+                f"ref_prompt_source={timbre_memory_config.ref_speaker_prompt_token_source} "
+                f"ref_prompt_slot={timbre_memory_config.ref_speaker_prompt_slot} "
+                f"ref_prompt_slot_code={timbre_memory_config.ref_speaker_prompt_slot_code} "
+                f"ref_prompt_slot_pack={timbre_memory_config.ref_speaker_prompt_slot_pack_mode} "
+                f"ref_prompt_output_norm={timbre_memory_config.ref_speaker_prompt_output_norm} "
+                f"ref_prompt_output_scale={timbre_memory_config.ref_speaker_prompt_output_scale:.4f} "
+                f"target_front_ce_weight={timbre_memory_config.target_front_ce_weight:.4f} "
+                f"target_front_ce_seconds={timbre_memory_config.target_front_ce_seconds:.4f} "
+                f"ref_adaln_weight={timbre_memory_config.ref_speaker_adaln_weight:.4f} "
+                f"infonce_weight={timbre_memory_config.speaker_infonce_weight:.4f} "
+                f"infonce_temp={timbre_memory_config.speaker_infonce_temperature:.4f} "
+                f"infonce_neg_pool={timbre_memory_config.speaker_infonce_negative_pool_size} "
+                f"infonce_neg_pool_seed={timbre_memory_config.speaker_infonce_negative_pool_seed} "
+                f"condition_dropout={timbre_memory_config.speaker_condition_dropout:.4f} "
+                f"speaker_side={timbre_memory_config.speaker_side_pathway_enabled} "
+                f"speaker_side_layers={timbre_memory_config.speaker_side_pathway_layers} "
+                f"speaker_side_kv={timbre_memory_config.speaker_side_pathway_kv_bias} "
+                f"speaker_side_gate_init={timbre_memory_config.speaker_side_pathway_gate_init:.4f} "
+                f"speaker_side_dropout={timbre_memory_config.speaker_side_pathway_dropout:.4f} "
+                f"speaker_cross_attn={timbre_memory_config.speaker_cross_attn_enabled} "
+                f"speaker_cross_attn_source={timbre_memory_config.speaker_cross_attn_source} "
+                f"speaker_cross_attn_seq_dim={timbre_memory_config.speaker_cross_attn_seq_dim} "
+                f"speaker_cross_attn_layers={timbre_memory_config.speaker_cross_attn_layers} "
+                f"speaker_cross_attn_tokens={timbre_memory_config.speaker_cross_attn_tokens} "
+                f"speaker_cross_attn_gate_init={timbre_memory_config.speaker_cross_attn_gate_init:.4f} "
+                f"speaker_cross_attn_dropout={timbre_memory_config.speaker_cross_attn_dropout:.4f} "
+                f"speaker_cross_attn_output_scale={timbre_memory_config.speaker_cross_attn_output_scale:.4f} "
+                f"speaker_cross_attn_token_init_std={timbre_memory_config.speaker_cross_attn_token_init_std} "
+                f"speaker_cross_attn_alpha_warmup_steps={timbre_memory_config.speaker_cross_attn_alpha_warmup_steps} "
+                f"use_perturbed_source_prompt={timbre_memory_config.use_perturbed_source_prompt}"
             )
     else:
         train_log_handle = None
@@ -2928,13 +3805,12 @@ def main() -> int:
             return None
         return float(gathered[finite].mean().item())
 
-    last_eval_step = -1
+    last_eval_steps: dict[str, int] = {}
 
-    def run_eval(step: int, *, reason: str) -> None:
-        nonlocal last_eval_step
-        if eval_loader is None:
+    def run_eval_one(step: int, *, reason: str, split: str, loader: Any) -> None:
+        if not eval_loaders:
             return
-        if int(step) == int(last_eval_step):
+        if int(step) == int(last_eval_steps.get(split, -1)):
             return
         if timbre_memory_config.enabled:
             set_speaker_aux_weights(
@@ -2957,7 +3833,7 @@ def main() -> int:
             metric_counts[name] = metric_counts.get(name, 0) + 1
 
         with torch.no_grad():
-            for eval_batch_idx, eval_batch in enumerate(eval_loader):
+            for eval_batch_idx, eval_batch in enumerate(loader):
                 if int(args.eval_max_batches) > 0 and eval_batch_idx >= int(args.eval_max_batches):
                     break
                 forward_kwargs = build_forward_kwargs_from_batch(
@@ -2981,13 +3857,15 @@ def main() -> int:
 
         if was_training:
             model.train()
-        last_eval_step = int(step)
+        last_eval_steps[split] = int(step)
         metrics = {name: metric_sums[name] / max(1, metric_counts[name]) for name in sorted(metric_sums)}
         elapsed = time.perf_counter() - eval_started
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            tb_prefix = "eval" if split == "eval" else f"eval_{split}"
             row = {
                 "step": int(step),
+                "split": split,
                 "reason": reason,
                 "batches": int(eval_batches),
                 "samples": int(eval_samples),
@@ -2999,13 +3877,13 @@ def main() -> int:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             if tb_writer is not None:
                 for metric_name, metric_value in metrics.items():
-                    tb_writer.add_scalar(f"eval/{metric_name}", float(metric_value), int(step))
-                tb_writer.add_scalar("eval/batches", int(eval_batches), int(step))
-                tb_writer.add_scalar("eval/samples", int(eval_samples), int(step))
+                    tb_writer.add_scalar(f"{tb_prefix}/{metric_name}", float(metric_value), int(step))
+                tb_writer.add_scalar(f"{tb_prefix}/batches", int(eval_batches), int(step))
+                tb_writer.add_scalar(f"{tb_prefix}/samples", int(eval_samples), int(step))
                 tb_writer.flush()
             loss_text = f"{metrics.get('loss', math.nan):.4f}" if "loss" in metrics else "nan"
             msg = (
-                f"eval step={step} reason={reason} loss={loss_text} "
+                f"eval split={split} step={step} reason={reason} loss={loss_text} "
                 f"batches={eval_batches} samples={eval_samples} elapsed={elapsed:.1f}s"
             )
             if "content_ctc_aux_loss" in metrics:
@@ -3026,24 +3904,66 @@ def main() -> int:
                 msg += f" source_semantic_progress_loss={metrics['source_semantic_progress_loss']:.4f}"
             if "progress_stop_aux_loss" in metrics:
                 msg += f" progress_stop_aux_loss={metrics['progress_stop_aux_loss']:.4f}"
+            if "speaker_side_gate_mean" in metrics:
+                msg += f" speaker_side_gate_mean={metrics['speaker_side_gate_mean']:.4f}"
+            if "speaker_cross_attn_gate_mean" in metrics:
+                msg += f" speaker_cross_attn_gate_mean={metrics['speaker_cross_attn_gate_mean']:.4f}"
             write_train_log(msg)
             accelerator.print(msg)
+
+    def run_eval(step: int, *, reason: str) -> None:
+        for split, loader in eval_loaders:
+            run_eval_one(step, reason=reason, split=split, loader=loader)
+
+    if args.eval_only:
+        if not eval_loaders:
+            raise ValueError("--eval-only requires at least one eval loader")
+        eval_only_started = time.perf_counter()
+        accelerator.wait_for_everyone()
+        run_eval(0, reason="eval_only")
+        if accelerator.is_main_process:
+            if tb_writer is not None:
+                tb_writer.flush()
+                tb_writer.close()
+            write_train_log(f"eval_only finished elapsed={time.perf_counter() - eval_only_started:.1f}s")
+            if train_log_handle is not None:
+                train_log_handle.close()
+        return 0
 
     model.train()
     global_step = 0
     saw_nonzero_lora_grad = False
     saw_nonzero_timbre_grad = False
+    saw_nonzero_ref_speaker_prompt_grad = False
     saw_nonzero_routing_gate_grad = False
     saw_nonzero_source_semantic_grad = False
     saw_nonzero_source_semantic_gate_grad = False
     expect_source_semantic_gate_grad = False
     saw_nonzero_content_ctc_head_grad = False
+    saw_nonzero_speaker_side_adaln_grad = False
+    saw_nonzero_speaker_side_kv_bias_grad = False
+    saw_nonzero_speaker_side_gate_grad = False
+    saw_nonzero_speaker_cross_attn_grad = False
+    saw_nonzero_speaker_cross_attn_gate_grad = False
     last_lora_grad_norm = 0.0
     last_timbre_grad_norm = 0.0
+    last_ref_speaker_prompt_grad_norm = 0.0
     last_routing_gate_grad_norm = 0.0
     last_source_semantic_grad_norm = 0.0
     last_source_semantic_gate_grad_norm = 0.0
     last_content_ctc_head_grad_norm = 0.0
+    last_speaker_side_adaln_grad_norm = 0.0
+    last_speaker_side_kv_bias_grad_norm = 0.0
+    last_speaker_side_gate_grad_norm = 0.0
+    last_speaker_cross_attn_grad_norm = 0.0
+    last_speaker_cross_attn_gate_grad_norm = 0.0
+    speaker_side_max_grad_norms: dict[str, dict[str, float]] = {
+        "adaln": {},
+        "kv_bias": {},
+        "gate": {},
+        "cross_attn": {},
+        "cross_attn_gate": {},
+    }
     started = time.perf_counter()
     for epoch in range(effective_num_epochs):
         for batch in train_loader:
@@ -3062,6 +3982,7 @@ def main() -> int:
                         final_source_suppression_weight=final_source_speaker_suppression_weight,
                         warmup_steps=speaker_loss_warmup_steps,
                         warmup_weight=speaker_loss_warmup_weight,
+                        schedule=speaker_loss_schedule,
                     )
                     set_speaker_aux_weights(
                         accelerator.unwrap_model(model),
@@ -3075,6 +3996,28 @@ def main() -> int:
                     "channelwise_loss_weight": channelwise_loss_weight,
                 }
                 if timbre_memory_config.enabled:
+                    if (
+                        timbre_memory_config.speaker_cross_attn_enabled
+                        and int(timbre_memory_config.speaker_cross_attn_alpha_warmup_steps) > 0
+                    ):
+                        alpha = min(
+                            1.0,
+                            float(global_step + 1)
+                            / float(max(1, int(timbre_memory_config.speaker_cross_attn_alpha_warmup_steps))),
+                        )
+                        set_runtime_scale = getattr(
+                            accelerator.unwrap_model(model),
+                            "set_speaker_cross_attn_runtime_scale_multiplier",
+                            None,
+                        )
+                        if callable(set_runtime_scale):
+                            set_runtime_scale(alpha)
+                        active_config = getattr(accelerator.unwrap_model(model), "timbre_memory_config", None)
+                        if active_config is not None and hasattr(
+                            active_config,
+                            "speaker_cross_attn_runtime_scale_multiplier",
+                        ):
+                            active_config.speaker_cross_attn_runtime_scale_multiplier = float(alpha)
                     forward_kwargs.update(
                         {
                             "source_ref_codes": batch.get("source_ref_codes"),
@@ -3084,11 +4027,16 @@ def main() -> int:
                             "target_position_mask": batch["target_assistant_positions"],
                             "source_prompt_positions": batch["source_prompt_positions"],
                             "timbre_ref_prompt_positions": batch["timbre_ref_prompt_positions"],
+                            "ref_speaker_prompt_slot_positions": batch.get("ref_speaker_prompt_slot_positions"),
                             "role_ids": batch.get("role_ids"),
                             "vc_mode_id": batch["vc_mode_id"],
                             "source_speaker_embedding_path": batch.get("source_speaker_embedding_path"),
                             "timbre_ref_speaker_embedding_path": batch.get("timbre_ref_speaker_embedding_path"),
                             "target_speaker_embedding_path": batch.get("target_speaker_embedding_path"),
+                            "speaker_vec_path": batch.get("speaker_vec_path"),
+                            "speaker_seq_path": batch.get("speaker_seq_path"),
+                            "speaker_seq_features": batch.get("speaker_seq_features"),
+                            "speaker_seq_features_mask": batch.get("speaker_seq_features_mask"),
                             "source_speaker_audio_path": batch.get("source_speaker_audio_path"),
                             "timbre_ref_speaker_audio_path": batch.get("timbre_ref_speaker_audio_path"),
                             "target_speaker_audio_path": batch.get("target_speaker_audio_path"),
@@ -3122,6 +4070,8 @@ def main() -> int:
                 progress_stop_aux_stats: dict[str, float] = {}
                 route_loss_value = None
                 route_stats: dict[str, float] = {}
+                speaker_side_stats: dict[str, float] = {}
+                target_front_ce_stats: dict[str, float] = {}
                 if timbre_memory_config.enabled:
                     unwrapped_for_stats = accelerator.unwrap_model(model)
                     speaker_aux_loss_value = getattr(unwrapped_for_stats, "last_speaker_aux_loss", None)
@@ -3158,6 +4108,8 @@ def main() -> int:
                     progress_stop_aux_stats = getattr(unwrapped_for_stats, "last_progress_stop_aux_stats", {}) or {}
                     route_loss_value = getattr(unwrapped_for_stats, "last_route_loss", None)
                     route_stats = getattr(unwrapped_for_stats, "last_route_stats", {}) or {}
+                    speaker_side_stats = getattr(unwrapped_for_stats, "last_speaker_side_stats", {}) or {}
+                    target_front_ce_stats = getattr(unwrapped_for_stats, "last_target_front_ce_stats", {}) or {}
                 if (
                     timbre_memory_config.enabled
                     and timbre_memory_config.source_semantic_memory_enabled
@@ -3177,6 +4129,71 @@ def main() -> int:
                     if timbre_memory_config.enabled:
                         last_timbre_grad_norm, has_nonzero_timbre = timbre_adapter_grad_stats(model)
                         saw_nonzero_timbre_grad = saw_nonzero_timbre_grad or has_nonzero_timbre
+                        (
+                            last_speaker_side_adaln_grad_norm,
+                            has_nonzero_speaker_side_adaln,
+                        ) = named_fragment_grad_stats(model, ("speaker_side_adaln",))
+                        saw_nonzero_speaker_side_adaln_grad = (
+                            saw_nonzero_speaker_side_adaln_grad or has_nonzero_speaker_side_adaln
+                        )
+                        merge_max_norms(
+                            speaker_side_max_grad_norms["adaln"],
+                            named_fragment_layer_grad_norms(model, "speaker_side_adaln"),
+                        )
+                        (
+                            last_speaker_side_kv_bias_grad_norm,
+                            has_nonzero_speaker_side_kv_bias,
+                        ) = named_fragment_grad_stats(model, ("speaker_side_kv_bias",))
+                        saw_nonzero_speaker_side_kv_bias_grad = (
+                            saw_nonzero_speaker_side_kv_bias_grad or has_nonzero_speaker_side_kv_bias
+                        )
+                        merge_max_norms(
+                            speaker_side_max_grad_norms["kv_bias"],
+                            named_fragment_layer_grad_norms(model, "speaker_side_kv_bias"),
+                        )
+                        (
+                            last_speaker_side_gate_grad_norm,
+                            has_nonzero_speaker_side_gate,
+                        ) = named_fragment_grad_stats(model, ("speaker_side_gate_logits",))
+                        saw_nonzero_speaker_side_gate_grad = (
+                            saw_nonzero_speaker_side_gate_grad or has_nonzero_speaker_side_gate
+                        )
+                        merge_max_norms(
+                            speaker_side_max_grad_norms["gate"],
+                            named_fragment_layer_grad_norms(model, "speaker_side_gate_logits"),
+                        )
+                        (
+                            last_speaker_cross_attn_grad_norm,
+                            has_nonzero_speaker_cross_attn,
+                        ) = named_fragment_grad_stats(
+                            model,
+                            ("speaker_cross_attn_tokens", "speaker_cross_attn_seq_projector", "speaker_cross_attn_layers"),
+                        )
+                        saw_nonzero_speaker_cross_attn_grad = (
+                            saw_nonzero_speaker_cross_attn_grad or has_nonzero_speaker_cross_attn
+                        )
+                        merge_max_norms(
+                            speaker_side_max_grad_norms["cross_attn"],
+                            named_fragment_layer_grad_norms(model, "speaker_cross_attn_layers"),
+                        )
+                        (
+                            last_speaker_cross_attn_gate_grad_norm,
+                            has_nonzero_speaker_cross_attn_gate,
+                        ) = speaker_cross_attn_gate_grad_stats(model)
+                        saw_nonzero_speaker_cross_attn_gate_grad = (
+                            saw_nonzero_speaker_cross_attn_gate_grad or has_nonzero_speaker_cross_attn_gate
+                        )
+                        merge_max_norms(
+                            speaker_side_max_grad_norms["cross_attn_gate"],
+                            speaker_cross_attn_gate_layer_grad_norms(model),
+                        )
+                        (
+                            last_ref_speaker_prompt_grad_norm,
+                            has_nonzero_ref_speaker_prompt,
+                        ) = ref_speaker_prompt_grad_stats(model)
+                        saw_nonzero_ref_speaker_prompt_grad = (
+                            saw_nonzero_ref_speaker_prompt_grad or has_nonzero_ref_speaker_prompt
+                        )
                         (
                             last_source_semantic_grad_norm,
                             has_nonzero_source_semantic,
@@ -3230,6 +4247,11 @@ def main() -> int:
                         if timbre_memory_config.enabled:
                             tb_writer.add_scalar("train/timbre_adapter_grad_norm", last_timbre_grad_norm, global_step)
                             tb_writer.add_scalar(
+                                "train/ref_speaker_prompt_grad_norm",
+                                last_ref_speaker_prompt_grad_norm,
+                                global_step,
+                            )
+                            tb_writer.add_scalar(
                                 "train/source_semantic_grad_norm",
                                 last_source_semantic_grad_norm,
                                 global_step,
@@ -3245,6 +4267,33 @@ def main() -> int:
                                 last_content_ctc_head_grad_norm,
                                 global_step,
                             )
+                            if timbre_memory_config.speaker_side_pathway_enabled:
+                                tb_writer.add_scalar(
+                                    "train/speaker_side_adaln_grad_norm",
+                                    last_speaker_side_adaln_grad_norm,
+                                    global_step,
+                                )
+                                tb_writer.add_scalar(
+                                    "train/speaker_side_kv_bias_grad_norm",
+                                    last_speaker_side_kv_bias_grad_norm,
+                                    global_step,
+                                )
+                                tb_writer.add_scalar(
+                                    "train/speaker_side_gate_grad_norm",
+                                    last_speaker_side_gate_grad_norm,
+                                    global_step,
+                                )
+                            if timbre_memory_config.speaker_cross_attn_enabled:
+                                tb_writer.add_scalar(
+                                    "train/speaker_cross_attn_grad_norm",
+                                    last_speaker_cross_attn_grad_norm,
+                                    global_step,
+                                )
+                                tb_writer.add_scalar(
+                                    "train/speaker_cross_attn_gate_grad_norm",
+                                    last_speaker_cross_attn_gate_grad_norm,
+                                    global_step,
+                                )
                             if len(lr_scheduler.get_last_lr()) > 1:
                                 tb_writer.add_scalar("train/routing_gate_lr", lr_scheduler.get_last_lr()[1], global_step)
                             if source_semantic_gate_initial_snapshot:
@@ -3314,6 +4363,10 @@ def main() -> int:
                                 tb_writer.add_scalar("train/route_loss", float(route_loss_value), global_step)
                             for stat_name, stat_value in route_stats.items():
                                 tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
+                            for stat_name, stat_value in speaker_side_stats.items():
+                                tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
+                            for stat_name, stat_value in target_front_ce_stats.items():
+                                tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
                             for stat_name, stat_value in routing_gate_delta_values.items():
                                 tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
                         tb_writer.add_scalar("train/epoch", epoch, global_step)
@@ -3324,10 +4377,18 @@ def main() -> int:
                     )
                     if timbre_memory_config.enabled:
                         msg += f" timbre_adapter_grad_norm={last_timbre_grad_norm:.4f}"
+                        msg += f" ref_speaker_prompt_grad_norm={last_ref_speaker_prompt_grad_norm:.6f}"
                         msg += f" source_semantic_grad_norm={last_source_semantic_grad_norm:.4f}"
                         msg += f" routing_gate_grad_norm={last_routing_gate_grad_norm:.6f}"
                         msg += f" source_semantic_gate_grad_norm={last_source_semantic_gate_grad_norm:.6f}"
                         msg += f" content_ctc_head_grad_norm={last_content_ctc_head_grad_norm:.6f}"
+                        if timbre_memory_config.speaker_side_pathway_enabled:
+                            msg += f" speaker_side_adaln_grad_norm={last_speaker_side_adaln_grad_norm:.6f}"
+                            msg += f" speaker_side_kv_bias_grad_norm={last_speaker_side_kv_bias_grad_norm:.6f}"
+                            msg += f" speaker_side_gate_grad_norm={last_speaker_side_gate_grad_norm:.6f}"
+                        if timbre_memory_config.speaker_cross_attn_enabled:
+                            msg += f" speaker_cross_attn_grad_norm={last_speaker_cross_attn_grad_norm:.6f}"
+                            msg += f" speaker_cross_attn_gate_grad_norm={last_speaker_cross_attn_gate_grad_norm:.6f}"
                         if speaker_aux_loss_value is not None:
                             msg += f" speaker_aux_loss={float(speaker_aux_loss_value):.4f}"
                         msg += (
@@ -3398,6 +4459,34 @@ def main() -> int:
                             msg += f" source_minus_ref_cos={speaker_aux_stats['source_minus_ref_cos']:.4f}"
                         if route_loss_value is not None:
                             msg += f" route_loss={float(route_loss_value):.4f}"
+                        if "speaker_side_gate_mean" in speaker_side_stats:
+                            msg += f" speaker_side_gate_mean={speaker_side_stats['speaker_side_gate_mean']:.4f}"
+                        if "speaker_side_dropout_rate" in speaker_side_stats:
+                            msg += f" speaker_side_dropout={speaker_side_stats['speaker_side_dropout_rate']:.4f}"
+                        if "speaker_cross_attn_gate_mean" in speaker_side_stats:
+                            msg += f" speaker_cross_attn_gate_mean={speaker_side_stats['speaker_cross_attn_gate_mean']:.4f}"
+                        if "speaker_cross_attn_token_norm_mean" in speaker_side_stats:
+                            msg += (
+                                f" speaker_cross_attn_token_norm="
+                                f"{speaker_side_stats['speaker_cross_attn_token_norm_mean']:.4f}"
+                            )
+                        if "speaker_cross_attn_delta_ratio" in speaker_side_stats:
+                            msg += (
+                                f" speaker_cross_attn_delta_ratio="
+                                f"{speaker_side_stats['speaker_cross_attn_delta_ratio']:.6f}"
+                            )
+                        if "speaker_cross_attn_runtime_scale_multiplier" in speaker_side_stats:
+                            msg += (
+                                f" speaker_cross_attn_alpha="
+                                f"{speaker_side_stats['speaker_cross_attn_runtime_scale_multiplier']:.4f}"
+                            )
+                        if float(target_front_ce_stats.get("target_front_ce_weighted_tokens", 0.0)) > 0.0:
+                            msg += (
+                                f" target_front_ce_weight={target_front_ce_stats.get('target_front_ce_weight', 1.0):.3f}"
+                                f" target_front_ce_frames={target_front_ce_stats.get('target_front_ce_frames', 0.0):.1f}"
+                                f" target_front_ce_tokens="
+                                f"{target_front_ce_stats.get('target_front_ce_weighted_tokens', 0.0):.0f}"
+                            )
                         if "role_gate_mean" in route_stats:
                             msg += f" role_gate_mean={route_stats['role_gate_mean']:.4f}"
                         if "prosody_head_gate_mean" in route_stats:
@@ -3433,7 +4522,7 @@ def main() -> int:
                         )
                     save_accelerated_checkpoint(save_dir)
                     saved_this_step = True
-                should_eval = eval_loader is not None and (
+                should_eval = bool(eval_loaders) and (
                     (args.eval_steps > 0 and global_step % args.eval_steps == 0)
                     or (args.eval_steps <= 0 and saved_this_step)
                 )
@@ -3441,8 +4530,24 @@ def main() -> int:
                     run_eval(global_step, reason="checkpoint" if saved_this_step else "interval")
                 if global_step >= max_train_steps:
                     break
+        if eval_loaders and global_step > 0:
+            run_eval(global_step, reason="epoch_end")
         if global_step >= max_train_steps:
             break
+
+    if (
+        accelerator.is_main_process
+        and args.smoke_test
+        and timbre_memory_config.enabled
+        and (timbre_memory_config.speaker_side_pathway_enabled or timbre_memory_config.speaker_cross_attn_enabled)
+    ):
+        write_ver29_smoke_train_diagnostics(
+            Path(args.output_dir),
+            accelerator.unwrap_model(model),
+            initial_snapshot=speaker_side_initial_snapshot,
+            max_grad_norms=speaker_side_max_grad_norms,
+            global_step=global_step,
+        )
 
     if args.smoke_test and not saw_nonzero_lora_grad:
         raise RuntimeError("Smoke test failed: LoRA gradients are all zero")
@@ -3456,9 +4561,21 @@ def main() -> int:
         and not saw_nonzero_source_semantic_gate_grad
     ):
         raise RuntimeError("Smoke test failed: SourceSemanticAdapter gate gradients are all zero")
+    if args.smoke_test and timbre_memory_config.speaker_side_pathway_enabled:
+        if not saw_nonzero_speaker_side_adaln_grad:
+            raise RuntimeError("Smoke test failed: speaker-side AdaLN gradients are all zero")
+        if timbre_memory_config.speaker_side_pathway_kv_bias and not saw_nonzero_speaker_side_kv_bias_grad:
+            raise RuntimeError("Smoke test failed: speaker-side K/V bias gradients are all zero")
+        if not saw_nonzero_speaker_side_gate_grad:
+            raise RuntimeError("Smoke test failed: speaker-side gate gradients are all zero")
+    if args.smoke_test and timbre_memory_config.speaker_cross_attn_enabled:
+        if not saw_nonzero_speaker_cross_attn_grad:
+            raise RuntimeError("Smoke test failed: speaker cross-attn gradients are all zero")
+        if not saw_nonzero_speaker_cross_attn_gate_grad:
+            raise RuntimeError("Smoke test failed: speaker cross-attn gate gradients are all zero")
 
     accelerator.wait_for_everyone()
-    if eval_loader is not None:
+    if eval_loaders:
         run_eval(global_step, reason="final")
     final_dir = Path(args.output_dir) / "final"
     if timbre_memory_config.enabled:

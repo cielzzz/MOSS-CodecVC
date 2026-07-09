@@ -28,8 +28,12 @@ PREPARED_DIR="${PREPARED_DIR:-$ROOT/trainset/ver2_8_prepared}"
 AUTO_PREPARE_VER2_8="${AUTO_PREPARE_VER2_8:-1}"
 PREPARED_NO_TEXT_TRAIN="$PREPARED_DIR/no_text.train.jsonl"
 PREPARED_NO_TEXT_VALID="$PREPARED_DIR/no_text.valid.jsonl"
+PREPARED_NO_TEXT_SEEN_VALID="$PREPARED_DIR/no_text.seen_valid.jsonl"
+PREPARED_NO_TEXT_UNSEEN_VALID="$PREPARED_DIR/no_text.unseen_valid.jsonl"
 PREPARED_TEXT_TRAIN="$PREPARED_DIR/text.train.jsonl"
 PREPARED_TEXT_VALID="$PREPARED_DIR/text.valid.jsonl"
+PREPARED_TEXT_SEEN_VALID="$PREPARED_DIR/text.seen_valid.jsonl"
+PREPARED_TEXT_UNSEEN_VALID="$PREPARED_DIR/text.unseen_valid.jsonl"
 
 print_wavlm_prepare_help() {
   echo "Prepare WavLM manifests first. Recommended H200/QZ entry:" >&2
@@ -130,20 +134,26 @@ export TARGET_SPK_WEIGHT="${TARGET_SPK_WEIGHT:-0.20}"
 export SOURCE_SUPPRESS_WEIGHT="${SOURCE_SUPPRESS_WEIGHT:-0.10}"
 export SPEAKER_LOSS_WARMUP_WEIGHT="${SPEAKER_LOSS_WARMUP_WEIGHT:-0.05}"
 
-if [ -f "$ROOT/testset/validation/ver2_3_debug/moss_codecvc_ver2_3_loss_valid_160.jsonl" ]; then
+if [ "${DISABLE_EVAL:-0}" != "1" ] && [ -f "$PREPARED_NO_TEXT_SEEN_VALID" ] && [ -f "$PREPARED_TEXT_SEEN_VALID" ] && [ -f "$PREPARED_NO_TEXT_UNSEEN_VALID" ] && [ -f "$PREPARED_TEXT_UNSEEN_VALID" ]; then
+  export EVAL_SEEN_JSONL_SPEC="${EVAL_SEEN_JSONL_SPEC:-$PREPARED_NO_TEXT_SEEN_VALID::repeat=1,$PREPARED_TEXT_SEEN_VALID::repeat=1}"
+  export EVAL_UNSEEN_JSONL_SPEC="${EVAL_UNSEEN_JSONL_SPEC:-$PREPARED_NO_TEXT_UNSEEN_VALID::repeat=1,$PREPARED_TEXT_UNSEEN_VALID::repeat=1}"
+  export EVAL_STEPS="${EVAL_STEPS:-2000}"
+elif [ "${DISABLE_EVAL:-0}" != "1" ] && [ -f "$ROOT/testset/validation/ver2_3_debug/moss_codecvc_ver2_3_loss_valid_160.jsonl" ]; then
   export EVAL_JSONL_SPEC="${EVAL_JSONL_SPEC:-$PREPARED_NO_TEXT_VALID::repeat=1,$PREPARED_TEXT_VALID::repeat=1}"
   export EVAL_STEPS="${EVAL_STEPS:-1000}"
 fi
 
 echo "[ver2.8-submit] TRAIN_JSONL_SPEC=$TRAIN_JSONL_SPEC"
 echo "[ver2.8-submit] EVAL_JSONL_SPEC=${EVAL_JSONL_SPEC:-}"
+echo "[ver2.8-submit] EVAL_SEEN_JSONL_SPEC=${EVAL_SEEN_JSONL_SPEC:-}"
+echo "[ver2.8-submit] EVAL_UNSEEN_JSONL_SPEC=${EVAL_UNSEEN_JSONL_SPEC:-}"
 echo "[ver2.8-submit] OUT_DIR=$OUT_DIR"
 echo "[ver2.8-submit] CTC=$CONTENT_CTC_WEIGHT timbre_side_only=$TIMBRE_SIDE_ONLY source_content_memory=$SOURCE_CONTENT_MEMORY_TYPE"
 echo "[ver2.8-submit] semantic_loss=$SEMANTIC_LOSS_WEIGHT mode=$SEMANTIC_MODE source=$SEMANTIC_SOURCE feature_dim=$SEMANTIC_FEATURE_DIM"
 echo "[ver2.8-submit] source_semantic_feature_dim=$SOURCE_SEMANTIC_FEATURE_DIM codec_residual_weight=$SOURCE_CODEC_RESIDUAL_MEMORY_WEIGHT"
 echo "[ver2.8-submit] source_prosody_gates no_text=$SOURCE_PROSODY_NO_TEXT_GATE text=$SOURCE_PROSODY_TEXT_GATE"
 echo "[ver2.8-submit] ref_content_suppression=$REF_CONTENT_SUPPRESSION_WEIGHT margin=$REF_CONTENT_SUPPRESSION_MARGIN"
-if [ -f "$ROOT/scripts/002017_summarize_ver2_8_data.py" ]; then
+if [ "${SKIP_VER2_8_DATA_SUMMARY:-0}" != "1" ] && [ -f "$ROOT/scripts/002017_summarize_ver2_8_data.py" ]; then
   "$PY" "$ROOT/scripts/002017_summarize_ver2_8_data.py" \
     --prepared-dir "$PREPARED_DIR" \
     --no-text-wavlm-jsonl "$NO_TEXT_CLEAN" \
