@@ -42,6 +42,13 @@ from .auxiliary_losses import (
     compute_semantic_feature_loss,
     compute_source_codec_content_loss,
 )
+from .content_cross_attn import (
+    ContentConformerEncoder,
+    ContentCrossAttentionLayer,
+    ContentPhonemeClassifierHead,
+    compute_guided_attention_loss,
+    compute_phoneme_classifier_loss,
+)
 from .role_routing import PerCodebookTargetHeadRouter, RoleCodecRouter, SourceProsodyEncoder
 from .semantic_coverage import compute_semantic_attention_progress
 from .speaker_encoder import build_frozen_speaker_encoder
@@ -176,6 +183,18 @@ class TimbreMemoryConfig:
     source_content_dedup_units: bool = False
     source_codec_residual_memory_weight: float = 0.0
     source_codec_residual_memory_detach: bool = False
+    content_cross_attn_enabled: bool = False
+    content_cross_attn_layers: str | list[int] = "all"
+    content_cross_attn_feature_dim: int = 768
+    content_cross_attn_gate_init: float = -0.5
+    content_cross_attn_dropout: float = 0.0
+    content_cross_attn_output_scale: float = 0.3
+    content_encoder_layers: int = 2
+    content_encoder_conv_kernel_size: int = 7
+    guided_attn_loss_weight: float = 0.0
+    guided_attn_warmup_steps: int = 1000
+    guided_attn_band_frames: int = 3
+    phoneme_classifier_loss_weight: float = 0.0
     ref_content_suppression_weight: float = 0.0
     ref_content_suppression_margin: float = 0.0
     ref_content_suppression_source: str = "auto"
@@ -1472,6 +1491,47 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     for idx in self.source_semantic_layer_indices
                 }
             )
+        self.content_cross_attn_encoder: ContentConformerEncoder | None = None
+        self.content_cross_attn_layers: nn.ModuleDict | None = None
+        self.content_cross_attn_layer_indices: list[int] = []
+        self.content_phoneme_classifier: ContentPhonemeClassifierHead | None = None
+        if bool(config.content_cross_attn_enabled):
+            self.content_cross_attn_encoder = ContentConformerEncoder(
+                input_dim=int(config.content_cross_attn_feature_dim),
+                hidden_size=hidden_size,
+                num_layers=int(config.content_encoder_layers),
+                num_heads=int(config.num_heads),
+                dropout=float(config.content_cross_attn_dropout),
+                conv_kernel_size=int(config.content_encoder_conv_kernel_size),
+            )
+            self.content_cross_attn_layer_indices = parse_adapter_layers(
+                config.content_cross_attn_layers,
+                len(layers),
+            )
+            self.content_cross_attn_layers = nn.ModuleDict(
+                {
+                    str(idx): ContentCrossAttentionLayer(
+                        hidden_size=hidden_size,
+                        num_heads=int(config.num_heads),
+                        adapter_dim=int(config.adapter_dim),
+                        dropout=float(config.content_cross_attn_dropout),
+                        gate_init=float(config.content_cross_attn_gate_init),
+                        output_scale=float(config.content_cross_attn_output_scale),
+                    )
+                    for idx in self.content_cross_attn_layer_indices
+                }
+            )
+            if float(config.phoneme_classifier_loss_weight) > 0.0:
+                if int(config.content_token_vocab_size) <= 1:
+                    raise ValueError(
+                        "phoneme_classifier_loss_weight > 0 requires content_token_vocab_size > 1"
+                    )
+                self.content_phoneme_classifier = ContentPhonemeClassifierHead(
+                    hidden_size=hidden_size,
+                    vocab_size=int(config.content_token_vocab_size),
+                    adapter_dim=int(config.adapter_dim),
+                    dropout=float(config.content_cross_attn_dropout),
+                )
         self.content_source_codec_codebooks = parse_codebook_indices(config.content_source_codec_codebooks, n_vq)
         self.content_codec_head: SourceCodecContentHead | None = None
         if config.content_loss_weight > 0 and config.content_source_codec_weight > 0:
@@ -1522,9 +1582,14 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         self._active_target_position_progress: torch.Tensor | None = None
         self._active_source_semantic_memory: torch.Tensor | None = None
         self._active_source_semantic_mask: torch.Tensor | None = None
+        self._active_content_cross_attn_memory: torch.Tensor | None = None
+        self._active_content_cross_attn_mask: torch.Tensor | None = None
         self._active_vc_mode_id: torch.Tensor | None = None
         self._active_source_semantic_attentions: list[torch.Tensor] = []
         self._active_source_semantic_adapter_stats: list[dict[str, float]] = []
+        self._active_content_cross_attn_attentions: list[torch.Tensor] = []
+        self._active_content_cross_attn_stats: list[dict[str, float]] = []
+        self._content_guided_attn_runtime_step: int = 0
         self.capture_source_semantic_attention: bool = False
         self.source_semantic_attention_capture_max_tokens: int = 2048
         self.last_source_semantic_attention_maps: list[dict[str, Any]] = []
@@ -1532,6 +1597,9 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         self.last_timbre_memory_shape: tuple[int, ...] | None = None
         self.last_prosody_memory_shape: tuple[int, ...] | None = None
         self.last_source_semantic_memory_shape: tuple[int, ...] | None = None
+        self.last_content_cross_attn_memory_shape: tuple[int, ...] | None = None
+        self.last_content_cross_attn_aux_loss: float | None = None
+        self.last_content_cross_attn_aux_stats: dict[str, float] = {}
         self.last_source_semantic_aux_loss: float | None = None
         self.last_source_semantic_aux_stats: dict[str, float] = {}
         self.last_source_prosody_gate_stats: dict[str, float] = {}
@@ -1730,6 +1798,9 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             self.source_semantic_memory_encoder,
             self.source_semantic_codec_residual_encoder,
             self.source_semantic_layer_adapters,
+            self.content_cross_attn_encoder,
+            self.content_cross_attn_layers,
+            self.content_phoneme_classifier,
             self.role_router,
             self.source_prosody_encoder,
             self.target_head_router,
@@ -1753,6 +1824,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         hook_layer_indices = sorted(
             set(self.adapter_layer_indices)
             | set(self.source_semantic_layer_indices)
+            | set(self.content_cross_attn_layer_indices)
             | set(self.speaker_side_layer_indices)
             | set(self.speaker_cross_attn_layer_indices)
         )
@@ -1776,6 +1848,8 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             timbre_tokens = self._active_timbre_tokens
             semantic_memory = self._active_source_semantic_memory
             semantic_mask = self._active_source_semantic_mask
+            content_memory = self._active_content_cross_attn_memory
+            content_mask = self._active_content_cross_attn_mask
             vc_mode_id = self._active_vc_mode_id
             target_mask = self._active_target_position_mask
             target_progress = self._active_target_position_progress
@@ -1792,16 +1866,22 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 and str(layer_idx) in self.speaker_side_adaln
             )
             has_speaker_cross_attn = (
-            self._active_speaker_cross_attn_tokens is not None
+                self._active_speaker_cross_attn_tokens is not None
                 and self._active_speaker_cross_attn_mask is not None
                 and self.speaker_cross_attn_layers is not None
                 and str(layer_idx) in self.speaker_cross_attn_layers
+            )
+            has_content_cross_attn = (
+                content_memory is not None
+                and self.content_cross_attn_layers is not None
+                and str(layer_idx) in self.content_cross_attn_layers
             )
             if (
                 not has_timbre
                 and not has_semantic
                 and not has_speaker_side
                 and not has_speaker_cross_attn
+                and not has_content_cross_attn
             ) or target_mask is None:
                 return output
             hidden_states = output[0] if isinstance(output, tuple) else output
@@ -1827,6 +1907,10 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 cross_delta = self._speaker_cross_attn_delta(layer_idx, updated, mask)
                 if cross_delta is not None:
                     updated = updated + cross_delta
+            if has_content_cross_attn:
+                content_delta = self._content_cross_attn_delta(layer_idx, updated, mask)
+                if content_delta is not None:
+                    updated = updated + content_delta
             if self._active_ref_speaker_adaln is not None:
                 scale, shift = self._active_ref_speaker_adaln
                 scale = scale.to(device=updated.device, dtype=updated.dtype)
@@ -2374,6 +2458,145 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         stats["source_semantic_progress_loss_weighted"] = float(weighted.detach().item())
         self.last_source_semantic_aux_loss = float(weighted.detach().item())
         return weighted
+
+    def set_content_guided_attn_runtime_step(self, step: int) -> None:
+        self._content_guided_attn_runtime_step = max(0, int(step))
+
+    def _compute_content_cross_attn_memory(
+        self,
+        source_semantic_features: torch.Tensor | None,
+        source_semantic_features_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        self.last_content_cross_attn_memory_shape = None
+        self.last_content_cross_attn_aux_stats = {}
+        if self.content_cross_attn_encoder is None:
+            return None, None
+        if source_semantic_features is None:
+            self.last_content_cross_attn_aux_stats = {"content_cross_attn_memory_missing": 1.0}
+            return None, None
+        device = next(self.content_cross_attn_encoder.parameters()).device
+        features = source_semantic_features.to(device=device)
+        mask = None if source_semantic_features_mask is None else source_semantic_features_mask.to(device=device).bool()
+        state = self.content_cross_attn_encoder(features, mask)
+        self.last_content_cross_attn_memory_shape = tuple(state.memory.shape)
+        self.last_content_cross_attn_aux_stats.update(state.stats)
+        return state.memory, state.mask
+
+    def _refresh_content_cross_attn_stats(self) -> None:
+        stats_rows = self._active_content_cross_attn_stats
+        if not stats_rows:
+            return
+        aggregate_keys = (
+            "content_cross_attn_gate_mean",
+            "content_cross_attn_delta_norm",
+            "content_cross_attn_raw_delta_norm",
+            "content_cross_attn_hidden_norm",
+            "content_cross_attn_delta_ratio",
+            "content_cross_attn_output_scale",
+            "content_cross_attn_attn_entropy",
+            "content_cross_attn_attn_peak_mean",
+        )
+        for key in aggregate_keys:
+            values = [float(row[key]) for row in stats_rows if key in row]
+            if values:
+                self.last_content_cross_attn_aux_stats[key] = float(sum(values) / len(values))
+        self.last_content_cross_attn_aux_stats["content_cross_attn_layer_counted"] = float(len(stats_rows))
+
+    def _content_cross_attn_delta(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if (
+            self._active_content_cross_attn_memory is None
+            or self.content_cross_attn_layers is None
+            or str(layer_idx) not in self.content_cross_attn_layers
+        ):
+            return None
+        layer = self.content_cross_attn_layers[str(layer_idx)]
+        out = layer(
+            hidden_states,
+            self._active_content_cross_attn_memory.to(device=hidden_states.device),
+            target_mask.to(device=hidden_states.device),
+            None
+            if self._active_content_cross_attn_mask is None
+            else self._active_content_cross_attn_mask.to(device=hidden_states.device),
+        )
+        if out.attention_weights is not None:
+            self._active_content_cross_attn_attentions.append(out.attention_weights)
+        layer_stats = dict(out.stats)
+        for key, value in out.stats.items():
+            short_key = key.replace("content_cross_attn_", "")
+            layer_stats[f"content_cross_attn_layer_{layer_idx}_{short_key}"] = float(value)
+        self._active_content_cross_attn_stats.append(layer_stats)
+        self.last_content_cross_attn_aux_stats.update(
+            {
+                key: float(value)
+                for key, value in layer_stats.items()
+                if key.startswith(f"content_cross_attn_layer_{layer_idx}_")
+            }
+        )
+        self._refresh_content_cross_attn_stats()
+        return out.delta.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+    def _content_cross_attn_aux_loss(
+        self,
+        target_position_mask: torch.Tensor | None,
+        content_cross_attn_mask: torch.Tensor | None = None,
+        *,
+        content_cross_attn_memory: torch.Tensor | None = None,
+        content_token_ids: torch.Tensor | None = None,
+        content_token_ids_mask: torch.Tensor | None = None,
+        source_content_ids: torch.Tensor | None = None,
+        source_content_ids_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        self.last_content_cross_attn_aux_loss = None
+        stats = dict(self.last_content_cross_attn_aux_stats)
+        stats["content_cross_attn_enabled"] = 1.0 if self.content_cross_attn_encoder is not None else 0.0
+        stats["content_cross_attn_attention_layers"] = float(len(self._active_content_cross_attn_attentions))
+        if target_position_mask is None:
+            self.last_content_cross_attn_aux_stats = stats
+            return None
+        terms: list[torch.Tensor] = []
+        guided_weight = float(self.timbre_memory_config.guided_attn_loss_weight)
+        warmup_steps = int(self.timbre_memory_config.guided_attn_warmup_steps)
+        if guided_weight > 0.0:
+            if warmup_steps > 0:
+                step = max(0, int(self._content_guided_attn_runtime_step))
+                warmup = min(1.0, float(step) / float(max(1, warmup_steps)))
+            else:
+                warmup = 1.0
+            guided_loss, guided_stats = compute_guided_attention_loss(
+                self._active_content_cross_attn_attentions,
+                target_position_mask,
+                content_cross_attn_mask,
+                band_frames=int(self.timbre_memory_config.guided_attn_band_frames),
+            )
+            stats.update(guided_stats)
+            stats["content_guided_attn_weight"] = guided_weight
+            stats["content_guided_attn_warmup"] = float(warmup)
+            if guided_loss is not None and warmup > 0.0:
+                terms.append(guided_loss * guided_loss.new_tensor(guided_weight * warmup))
+        phoneme_weight = float(self.timbre_memory_config.phoneme_classifier_loss_weight)
+        if phoneme_weight > 0.0 and self.content_phoneme_classifier is not None and content_cross_attn_memory is not None:
+            token_ids = content_token_ids if content_token_ids is not None else source_content_ids
+            token_mask = content_token_ids_mask if content_token_ids is not None else source_content_ids_mask
+            logits = self.content_phoneme_classifier(
+                content_cross_attn_memory.to(device=next(self.content_phoneme_classifier.parameters()).device)
+            )
+            phoneme_loss, phoneme_stats = compute_phoneme_classifier_loss(logits, token_ids, token_mask)
+            stats.update(phoneme_stats)
+            stats["content_phoneme_classifier_weight"] = phoneme_weight
+            if phoneme_loss is not None:
+                terms.append(phoneme_loss * phoneme_loss.new_tensor(phoneme_weight))
+        self.last_content_cross_attn_aux_stats = stats
+        if not terms:
+            return None
+        loss = torch.stack(terms).sum()
+        stats["content_cross_attn_aux_loss_weighted"] = float(loss.detach().item())
+        self.last_content_cross_attn_aux_loss = float(loss.detach().item())
+        return loss
 
     @staticmethod
     def _align_time_mask(mask: torch.Tensor | None, shape: tuple[int, int]) -> torch.Tensor | None:
@@ -3160,6 +3383,12 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         prosody_batch_gate: torch.Tensor | None = None,
         source_semantic_memory: torch.Tensor | None = None,
         source_semantic_mask: torch.Tensor | None = None,
+        content_cross_attn_memory: torch.Tensor | None = None,
+        content_cross_attn_mask: torch.Tensor | None = None,
+        content_token_ids: torch.Tensor | None = None,
+        content_token_ids_mask: torch.Tensor | None = None,
+        source_content_ids: torch.Tensor | None = None,
+        source_content_ids_mask: torch.Tensor | None = None,
         vc_mode_id: torch.Tensor | None = None,
         role_ids: torch.Tensor | None = None,
         timbre_ref_prompt_positions: torch.Tensor | None = None,
@@ -3214,6 +3443,9 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 "inner_source_semantic_memory_shape": tuple(source_semantic_memory.shape)
                 if source_semantic_memory is not None
                 else None,
+                "inner_content_cross_attn_memory_shape": tuple(content_cross_attn_memory.shape)
+                if content_cross_attn_memory is not None
+                else None,
             }
         )
         self._active_timbre_tokens = timbre_tokens
@@ -3221,11 +3453,15 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         self._active_target_position_progress = None if target_position_progress is None else target_position_progress.float()
         self._active_source_semantic_memory = source_semantic_memory
         self._active_source_semantic_mask = source_semantic_mask
+        self._active_content_cross_attn_memory = content_cross_attn_memory
+        self._active_content_cross_attn_mask = content_cross_attn_mask
         self._active_vc_mode_id = vc_mode_id
         active_dtype = timbre_tokens.dtype if timbre_tokens is not None else next(self.parameters()).dtype
         self._active_ref_speaker_adaln = self._prepare_ref_speaker_adaln(dtype=active_dtype)
         self._active_source_semantic_attentions = []
         self._active_source_semantic_adapter_stats = []
+        self._active_content_cross_attn_attentions = []
+        self._active_content_cross_attn_stats = []
         try:
             outputs = self._forward_model()(*args, labels=base_labels, **kwargs)
             outputs = self._apply_target_head_routing(
@@ -3255,6 +3491,20 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     outputs.loss = source_semantic_loss
                 else:
                     outputs.loss = outputs.loss + source_semantic_loss
+            content_cross_attn_loss = self._content_cross_attn_aux_loss(
+                target_position_mask,
+                content_cross_attn_mask,
+                content_cross_attn_memory=content_cross_attn_memory,
+                content_token_ids=content_token_ids,
+                content_token_ids_mask=content_token_ids_mask,
+                source_content_ids=source_content_ids,
+                source_content_ids_mask=source_content_ids_mask,
+            )
+            if content_cross_attn_loss is not None:
+                if getattr(outputs, "loss", None) is None:
+                    outputs.loss = content_cross_attn_loss
+                else:
+                    outputs.loss = outputs.loss + content_cross_attn_loss
             self.last_forward_debug.update(
                 {
                     "output_loss_is_none": getattr(outputs, "loss", None) is None,
@@ -3268,6 +3518,8 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             self._active_target_position_progress = None
             self._active_source_semantic_memory = None
             self._active_source_semantic_mask = None
+            self._active_content_cross_attn_memory = None
+            self._active_content_cross_attn_mask = None
             self._active_vc_mode_id = None
             self._active_ref_speaker_adaln = None
             self._active_speaker_side_embedding = None
@@ -3278,6 +3530,8 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             self._active_speaker_cross_attn_stats = []
             self._active_source_semantic_attentions = []
             self._active_source_semantic_adapter_stats = []
+            self._active_content_cross_attn_attentions = []
+            self._active_content_cross_attn_stats = []
 
     def _target_hidden_for_aux(
         self,
@@ -4146,11 +4400,15 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             "use_role_routing": bool(self.timbre_memory_config.use_role_routing),
             "target_head_routing": self.target_head_router is not None,
             "source_semantic_memory_enabled": self.source_semantic_memory_encoder is not None,
+            "content_cross_attn_enabled": self.content_cross_attn_encoder is not None,
             "source_content_memory_type": self.source_content_memory_type,
         }
         self.last_source_semantic_aux_loss = None
         self.last_source_semantic_aux_stats = {}
         self.last_source_semantic_memory_shape = None
+        self.last_content_cross_attn_aux_loss = None
+        self.last_content_cross_attn_aux_stats = {}
+        self.last_content_cross_attn_memory_shape = None
         self.last_ref_content_suppression_loss = None
         self.last_ref_content_suppression_stats = {}
         if target_position_mask is None and labels is not None:
@@ -4184,7 +4442,12 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         side_pathway_enabled = bool(self.timbre_memory_config.speaker_side_pathway_enabled) or bool(
             self.timbre_memory_config.speaker_cross_attn_enabled
         )
-        if (timbre_ref_codes is None and not side_pathway_enabled) or target_position_mask is None:
+        content_cross_attn_enabled = self.content_cross_attn_encoder is not None
+        if (
+            timbre_ref_codes is None
+            and not side_pathway_enabled
+            and not content_cross_attn_enabled
+        ) or target_position_mask is None:
             if self.role_router is not None and input_ids is not None and resolved_role_ids is not None:
                 kwargs["inputs_embeds"] = self.role_router.compute_input_embeddings(
                     self.get_base_model(),
@@ -4212,6 +4475,13 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 input_ids=input_ids,
                 source_prompt_positions=source_prompt_positions,
             )
+        content_cross_attn_memory = None
+        content_cross_attn_mask = None
+        if self.content_cross_attn_encoder is not None:
+            content_cross_attn_memory, content_cross_attn_mask = self._compute_content_cross_attn_memory(
+                source_semantic_features,
+                source_semantic_features_mask,
+            )
         batch_size = int(target_position_mask.shape[0])
         condition_device = input_ids.device if input_ids is not None else next(self.parameters()).device
         condition_dtype = next(self.parameters()).dtype
@@ -4230,12 +4500,15 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             )
             timbre_tokens = None
         else:
-            timbre_tokens = self._compute_timbre_tokens(
-                timbre_ref_codes,
-                timbre_ref_mask,
-                timbre_ref_speaker_embedding_path=timbre_ref_speaker_embedding_path,
-                timbre_ref_speaker_audio_path=timbre_ref_speaker_audio_path,
-            )
+            if self.legacy_timbre_memory_enabled:
+                timbre_tokens = self._compute_timbre_tokens(
+                    timbre_ref_codes,
+                    timbre_ref_mask,
+                    timbre_ref_speaker_embedding_path=timbre_ref_speaker_embedding_path,
+                    timbre_ref_speaker_audio_path=timbre_ref_speaker_audio_path,
+                )
+            else:
+                timbre_tokens = None
         outputs = self._forward_with_timbre_tokens(
             *args,
             timbre_tokens=timbre_tokens,
@@ -4244,6 +4517,12 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             prosody_batch_gate=prosody_batch_gate,
             source_semantic_memory=source_semantic_memory,
             source_semantic_mask=source_semantic_memory_mask,
+            content_cross_attn_memory=content_cross_attn_memory,
+            content_cross_attn_mask=content_cross_attn_mask,
+            content_token_ids=content_token_ids,
+            content_token_ids_mask=content_token_ids_mask,
+            source_content_ids=source_content_ids,
+            source_content_ids_mask=source_content_ids_mask,
             vc_mode_id=vc_mode_id,
             role_ids=resolved_role_ids,
             timbre_ref_prompt_positions=timbre_ref_prompt_positions,
@@ -4421,6 +4700,12 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             )
         if wrapper.source_semantic_layer_adapters is not None and state.get("source_semantic_layer_adapters") is not None:
             wrapper.source_semantic_layer_adapters.load_state_dict(state["source_semantic_layer_adapters"])
+        if wrapper.content_cross_attn_encoder is not None and state.get("content_cross_attn_encoder") is not None:
+            wrapper.content_cross_attn_encoder.load_state_dict(state["content_cross_attn_encoder"])
+        if wrapper.content_cross_attn_layers is not None and state.get("content_cross_attn_layers") is not None:
+            wrapper.content_cross_attn_layers.load_state_dict(state["content_cross_attn_layers"])
+        if wrapper.content_phoneme_classifier is not None and state.get("content_phoneme_classifier") is not None:
+            wrapper.content_phoneme_classifier.load_state_dict(state["content_phoneme_classifier"])
         if wrapper.role_router is not None and state.get("role_router") is not None:
             wrapper.role_router.load_state_dict(state["role_router"])
         if wrapper.source_prosody_encoder is not None and state.get("source_prosody_encoder") is not None:
@@ -4577,7 +4862,8 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         side_pathway_enabled = bool(self.timbre_memory_config.speaker_side_pathway_enabled) or bool(
             self.timbre_memory_config.speaker_cross_attn_enabled
         )
-        if timbre_ref_codes is None and not side_pathway_enabled:
+        content_cross_attn_enabled = self.content_cross_attn_encoder is not None
+        if timbre_ref_codes is None and not side_pathway_enabled and not content_cross_attn_enabled:
             return self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -4609,7 +4895,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 adapter.monotonic_release_start = release_start
         cfg_scale = float(timbre_cfg_scale)
         cfg_timbre_tokens = None
-        if abs(cfg_scale - 1.0) > 1.0e-6 and not side_pathway_enabled:
+        if abs(cfg_scale - 1.0) > 1.0e-6 and not side_pathway_enabled and self.legacy_timbre_memory_enabled:
             cfg_timbre_tokens = self._compute_timbre_tokens(
                 timbre_ref_codes,
                 timbre_ref_mask,
@@ -4619,13 +4905,15 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             )
         if side_pathway_enabled:
             timbre_tokens = None
-        else:
+        elif self.legacy_timbre_memory_enabled:
             timbre_tokens = self._compute_timbre_tokens(
                 timbre_ref_codes,
                 timbre_ref_mask,
                 timbre_ref_speaker_embedding_path=timbre_ref_speaker_embedding_path,
                 timbre_ref_speaker_audio_path=timbre_ref_speaker_audio_path,
             )
+        else:
+            timbre_tokens = None
         prompt_role_ids = None
         prompt_source_positions = None
         prosody_tokens = None
@@ -4690,6 +4978,13 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 source_ref_mask=source_ref_mask,
                 input_ids=input_ids,
                 source_prompt_positions=prompt_source_positions,
+            )
+        content_cross_attn_memory = None
+        content_cross_attn_mask = None
+        if self.content_cross_attn_encoder is not None:
+            content_cross_attn_memory, content_cross_attn_mask = self._compute_content_cross_attn_memory(
+                source_semantic_features,
+                source_semantic_features_mask,
             )
         if text_temperature > 0:
             text_do_sample = True
@@ -4808,6 +5103,10 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     prosody_batch_gate=prosody_batch_gate,
                     source_semantic_memory=source_semantic_memory,
                     source_semantic_mask=source_semantic_memory_mask,
+                    content_cross_attn_memory=content_cross_attn_memory,
+                    content_cross_attn_mask=content_cross_attn_mask,
+                    content_token_ids=content_token_ids,
+                    content_token_ids_mask=content_token_ids_mask,
                     vc_mode_id=vc_mode_id,
                     role_ids=current_role_ids,
                     timbre_ref_prompt_positions=None,
@@ -4849,6 +5148,10 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     prosody_batch_gate=prosody_batch_gate,
                     source_semantic_memory=source_semantic_memory,
                     source_semantic_mask=source_semantic_memory_mask,
+                    content_cross_attn_memory=content_cross_attn_memory,
+                    content_cross_attn_mask=content_cross_attn_mask,
+                    content_token_ids=content_token_ids,
+                    content_token_ids_mask=content_token_ids_mask,
                     vc_mode_id=vc_mode_id,
                     role_ids=current_role_ids,
                     timbre_ref_prompt_positions=None,
@@ -4892,6 +5195,10 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     prosody_batch_gate=prosody_batch_gate,
                     source_semantic_memory=source_semantic_memory,
                     source_semantic_mask=source_semantic_memory_mask,
+                    content_cross_attn_memory=content_cross_attn_memory,
+                    content_cross_attn_mask=content_cross_attn_mask,
+                    content_token_ids=content_token_ids,
+                    content_token_ids_mask=content_token_ids_mask,
                     vc_mode_id=vc_mode_id,
                     role_ids=current_role_ids,
                     timbre_ref_prompt_positions=None,
@@ -5264,6 +5571,18 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 "source_semantic_layer_adapters": extract_module_state(
                     "source_semantic_layer_adapters",
                     self.source_semantic_layer_adapters,
+                ),
+                "content_cross_attn_encoder": extract_module_state(
+                    "content_cross_attn_encoder",
+                    self.content_cross_attn_encoder,
+                ),
+                "content_cross_attn_layers": extract_module_state(
+                    "content_cross_attn_layers",
+                    self.content_cross_attn_layers,
+                ),
+                "content_phoneme_classifier": extract_module_state(
+                    "content_phoneme_classifier",
+                    self.content_phoneme_classifier,
                 ),
                 "role_router": extract_module_state("role_router", self.role_router),
                 "source_prosody_encoder": extract_module_state("source_prosody_encoder", self.source_prosody_encoder),

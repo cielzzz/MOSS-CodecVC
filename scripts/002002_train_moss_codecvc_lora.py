@@ -382,6 +382,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Detach source codec embeddings before the residual bottleneck memory encoder.",
     )
+    ap.add_argument("--enable-content-cross-attn", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument("--content-cross-attn-layers", default=None)
+    ap.add_argument("--content-cross-attn-feature-dim", type=int, default=None)
+    ap.add_argument("--content-cross-attn-gate-init", type=float, default=None)
+    ap.add_argument("--content-cross-attn-dropout", type=float, default=None)
+    ap.add_argument("--content-cross-attn-output-scale", type=float, default=None)
+    ap.add_argument("--content-encoder-layers", type=int, default=None)
+    ap.add_argument("--content-encoder-conv-kernel-size", type=int, default=None)
+    ap.add_argument("--guided-attn-loss-weight", type=float, default=None)
+    ap.add_argument("--guided-attn-warmup-steps", type=int, default=None)
+    ap.add_argument("--guided-attn-band-frames", type=int, default=None)
+    ap.add_argument("--phoneme-classifier-loss-weight", type=float, default=None)
     ap.add_argument(
         "--timbre-side-only",
         action=argparse.BooleanOptionalAction,
@@ -1312,6 +1324,9 @@ def apply_ver25_freeze_controls(model: torch.nn.Module, args: argparse.Namespace
         "speaker_cross_attn_tokens",
         "speaker_cross_attn_seq_projector",
         "speaker_cross_attn_layers",
+        "content_cross_attn_encoder",
+        "content_cross_attn_layers",
+        "content_phoneme_classifier",
         "null_speaker_embedding",
     )
     route_markers = (
@@ -1388,15 +1403,21 @@ def is_source_semantic_gate_param_name(name: str) -> bool:
     )
 
 
+def is_content_cross_attn_gate_param_name(name: str) -> bool:
+    return "content_cross_attn_layers" in name and name.endswith(".gate_logit")
+
+
 def is_timbre_adapter_gate_param_name(name: str) -> bool:
     return (
         (
             "source_semantic_layer_adapters" not in name
+            and "content_cross_attn_layers" not in name
             and "layer_adapters" in name
             and name.endswith(".gate")
         )
         or "speaker_side_gate_logits" in name
         or ("speaker_cross_attn_layers" in name and name.endswith(".gate_logit"))
+        or is_content_cross_attn_gate_param_name(name)
     )
 
 
@@ -1429,6 +1450,14 @@ def is_source_semantic_trainable_param_name(name: str) -> bool:
         "source_semantic_memory_encoder" in name
         or "source_semantic_codec_residual_encoder" in name
         or "source_semantic_layer_adapters" in name
+    )
+
+
+def is_content_cross_attn_trainable_param_name(name: str) -> bool:
+    return (
+        "content_cross_attn_encoder" in name
+        or "content_cross_attn_layers" in name
+        or "content_phoneme_classifier" in name
     )
 
 
@@ -2166,6 +2195,66 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
             )
         )
     )
+    content_cross_attn_enabled = bool(deep_get(cfg, "content_cross_attn.enabled", False))
+    if args.enable_content_cross_attn is not None:
+        content_cross_attn_enabled = bool(args.enable_content_cross_attn)
+    if content_cross_attn_enabled:
+        enabled = True
+    content_cross_attn_layers = args.content_cross_attn_layers or deep_get(
+        cfg,
+        "content_cross_attn.layers",
+        "all",
+    )
+    content_cross_attn_feature_dim = (
+        int(args.content_cross_attn_feature_dim)
+        if args.content_cross_attn_feature_dim is not None
+        else int(deep_get(cfg, "content_cross_attn.input_dim", 768))
+    )
+    content_cross_attn_gate_init = (
+        float(args.content_cross_attn_gate_init)
+        if args.content_cross_attn_gate_init is not None
+        else float(deep_get(cfg, "content_cross_attn.gate_init", -0.5))
+    )
+    content_cross_attn_dropout = (
+        float(args.content_cross_attn_dropout)
+        if args.content_cross_attn_dropout is not None
+        else float(deep_get(cfg, "content_cross_attn.dropout", 0.0))
+    )
+    content_cross_attn_output_scale = (
+        float(args.content_cross_attn_output_scale)
+        if args.content_cross_attn_output_scale is not None
+        else float(deep_get(cfg, "content_cross_attn.output_scale", 0.3))
+    )
+    content_encoder_layers = (
+        int(args.content_encoder_layers)
+        if args.content_encoder_layers is not None
+        else int(deep_get(cfg, "content_cross_attn.encoder_layers", 2))
+    )
+    content_encoder_conv_kernel_size = (
+        int(args.content_encoder_conv_kernel_size)
+        if args.content_encoder_conv_kernel_size is not None
+        else int(deep_get(cfg, "content_cross_attn.encoder_conv_kernel_size", 7))
+    )
+    guided_attn_loss_weight = (
+        float(args.guided_attn_loss_weight)
+        if args.guided_attn_loss_weight is not None
+        else float(deep_get(cfg, "loss.guided_attn_loss_weight", 0.0))
+    )
+    guided_attn_warmup_steps = (
+        int(args.guided_attn_warmup_steps)
+        if args.guided_attn_warmup_steps is not None
+        else int(deep_get(cfg, "loss.guided_attn_warmup_steps", 1000))
+    )
+    guided_attn_band_frames = (
+        int(args.guided_attn_band_frames)
+        if args.guided_attn_band_frames is not None
+        else int(deep_get(cfg, "loss.guided_attn_band_frames", 3))
+    )
+    phoneme_classifier_loss_weight = (
+        float(args.phoneme_classifier_loss_weight)
+        if args.phoneme_classifier_loss_weight is not None
+        else float(deep_get(cfg, "loss.phoneme_classifier_loss_weight", 0.0))
+    )
     ref_content_suppression_weight = (
         float(args.ref_content_suppression_weight)
         if args.ref_content_suppression_weight is not None
@@ -2336,6 +2425,18 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         source_content_dedup_units=source_content_dedup_units,
         source_codec_residual_memory_weight=source_codec_residual_memory_weight,
         source_codec_residual_memory_detach=source_codec_residual_memory_detach,
+        content_cross_attn_enabled=content_cross_attn_enabled,
+        content_cross_attn_layers=content_cross_attn_layers,
+        content_cross_attn_feature_dim=content_cross_attn_feature_dim,
+        content_cross_attn_gate_init=content_cross_attn_gate_init,
+        content_cross_attn_dropout=content_cross_attn_dropout,
+        content_cross_attn_output_scale=content_cross_attn_output_scale,
+        content_encoder_layers=content_encoder_layers,
+        content_encoder_conv_kernel_size=content_encoder_conv_kernel_size,
+        guided_attn_loss_weight=guided_attn_loss_weight,
+        guided_attn_warmup_steps=guided_attn_warmup_steps,
+        guided_attn_band_frames=guided_attn_band_frames,
+        phoneme_classifier_loss_weight=phoneme_classifier_loss_weight,
         ref_content_suppression_weight=ref_content_suppression_weight,
         ref_content_suppression_margin=ref_content_suppression_margin,
         ref_content_suppression_source=ref_content_suppression_source,
@@ -2407,6 +2508,9 @@ def timbre_adapter_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
             and "speaker_cross_attn_tokens" not in name
             and "speaker_cross_attn_seq_projector" not in name
             and "speaker_cross_attn_layers" not in name
+            and "content_cross_attn_encoder" not in name
+            and "content_cross_attn_layers" not in name
+            and "content_phoneme_classifier" not in name
             and "null_speaker_embedding" not in name
         ) or param.grad is None:
             continue
@@ -2542,6 +2646,19 @@ def content_ctc_head_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
     has_nonzero = False
     for name, param in model.named_parameters():
         if "content_ctc_head" not in name or param.grad is None:
+            continue
+        grad = param.grad.detach().float()
+        norm = grad.norm(2).item()
+        total_norm_sq += norm * norm
+        has_nonzero = has_nonzero or torch.count_nonzero(grad).item() > 0
+    return math.sqrt(total_norm_sq), has_nonzero
+
+
+def content_cross_attn_gate_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
+    total_norm_sq = 0.0
+    has_nonzero = False
+    for name, param in model.named_parameters():
+        if not is_content_cross_attn_gate_param_name(name) or param.grad is None:
             continue
         grad = param.grad.detach().float()
         norm = grad.norm(2).item()
@@ -2896,6 +3013,7 @@ AUX_LOSS_ATTRS = {
     "content_ctc_aux_loss": "last_content_ctc_aux_loss",
     "semantic_aux_loss": "last_semantic_aux_loss",
     "source_semantic_aux_loss": "last_source_semantic_aux_loss",
+    "content_cross_attn_aux_loss": "last_content_cross_attn_aux_loss",
     "ref_content_suppression_loss": "last_ref_content_suppression_loss",
     "progress_stop_aux_loss": "last_progress_stop_aux_loss",
     "route_loss": "last_route_loss",
@@ -2969,6 +3087,7 @@ def collect_aux_loss_scalars(model: torch.nn.Module) -> dict[str, float | None]:
         "last_content_ctc_aux_stats",
         "last_semantic_aux_stats",
         "last_source_semantic_aux_stats",
+        "last_content_cross_attn_aux_stats",
         "last_ref_content_suppression_stats",
         "last_progress_stop_aux_stats",
         "last_route_stats",
@@ -3135,6 +3254,18 @@ def main() -> int:
     args.source_content_dedup_units = timbre_memory_config.source_content_dedup_units
     args.source_codec_residual_memory_weight = timbre_memory_config.source_codec_residual_memory_weight
     args.source_codec_residual_memory_detach = timbre_memory_config.source_codec_residual_memory_detach
+    args.enable_content_cross_attn = timbre_memory_config.content_cross_attn_enabled
+    args.content_cross_attn_layers = timbre_memory_config.content_cross_attn_layers
+    args.content_cross_attn_feature_dim = timbre_memory_config.content_cross_attn_feature_dim
+    args.content_cross_attn_gate_init = timbre_memory_config.content_cross_attn_gate_init
+    args.content_cross_attn_dropout = timbre_memory_config.content_cross_attn_dropout
+    args.content_cross_attn_output_scale = timbre_memory_config.content_cross_attn_output_scale
+    args.content_encoder_layers = timbre_memory_config.content_encoder_layers
+    args.content_encoder_conv_kernel_size = timbre_memory_config.content_encoder_conv_kernel_size
+    args.guided_attn_loss_weight = timbre_memory_config.guided_attn_loss_weight
+    args.guided_attn_warmup_steps = timbre_memory_config.guided_attn_warmup_steps
+    args.guided_attn_band_frames = timbre_memory_config.guided_attn_band_frames
+    args.phoneme_classifier_loss_weight = timbre_memory_config.phoneme_classifier_loss_weight
     args.ref_content_suppression_weight = timbre_memory_config.ref_content_suppression_weight
     args.ref_content_suppression_margin = timbre_memory_config.ref_content_suppression_margin
     args.ref_content_suppression_source = timbre_memory_config.ref_content_suppression_source
@@ -3164,21 +3295,25 @@ def main() -> int:
     records = load_training_records(args)
     source_content_memory_type = str(timbre_memory_config.source_content_memory_type or "hubert_continuous").strip().lower()
     source_content_uses_content_tokens = source_content_memory_type == "text_tokens"
+    phoneme_classifier_enabled = (
+        bool(timbre_memory_config.content_cross_attn_enabled)
+        and float(timbre_memory_config.phoneme_classifier_loss_weight) > 0.0
+    )
     validate_content_tokenizer_consistency(
         records,
-        enabled=timbre_memory_config.content_ctc_weight > 0 or source_content_uses_content_tokens,
+        enabled=timbre_memory_config.content_ctc_weight > 0 or source_content_uses_content_tokens or phoneme_classifier_enabled,
         allow_mixed=bool(args.allow_mixed_content_tokenizers),
     )
     manifest_content_vocab_size = (
         infer_content_ctc_vocab_size_from_manifest(records)
-        if timbre_memory_config.content_ctc_weight > 0 or source_content_uses_content_tokens
+        if timbre_memory_config.content_ctc_weight > 0 or source_content_uses_content_tokens or phoneme_classifier_enabled
         else 0
     )
     content_ctc_uses_manifest_tokens = manifest_content_vocab_size > 1
     content_tokenizer = None
     content_tokenizer_path = (
         infer_sentencepiece_content_tokenizer_path(records)
-        if timbre_memory_config.content_ctc_weight > 0 or source_content_uses_content_tokens
+        if timbre_memory_config.content_ctc_weight > 0 or source_content_uses_content_tokens or phoneme_classifier_enabled
         else ""
     )
     if content_tokenizer_path:
@@ -3200,6 +3335,22 @@ def main() -> int:
         print(
             "[source_content_memory] auto_vocab_size="
             f"{timbre_memory_config.source_content_vocab_size} padding_id={timbre_memory_config.source_content_padding_id}",
+            flush=True,
+        )
+    if phoneme_classifier_enabled and timbre_memory_config.content_token_vocab_size <= 1:
+        if manifest_content_vocab_size > 1:
+            timbre_memory_config.content_token_vocab_size = int(manifest_content_vocab_size)
+        else:
+            tokenizer_vocab_size = content_tokenizer_vocab_size(content_tokenizer)
+            if tokenizer_vocab_size <= 1:
+                tokenizer_vocab_size = len(processor.tokenizer)
+            timbre_memory_config.content_token_vocab_size = int(tokenizer_vocab_size) + int(
+                timbre_memory_config.content_ctc_token_offset
+            )
+        args.content_token_vocab_size = int(timbre_memory_config.content_token_vocab_size)
+        print(
+            "[content_phoneme_classifier] auto_vocab_size="
+            f"{timbre_memory_config.content_token_vocab_size}",
             flush=True,
         )
     if source_content_memory_type == "semantic_units" and timbre_memory_config.source_content_vocab_size <= 1:
@@ -3902,6 +4053,12 @@ def main() -> int:
                 msg += f" source_semantic_gate_mean={metrics['source_semantic_gate_mean']:.4f}"
             if "source_semantic_progress_loss" in metrics:
                 msg += f" source_semantic_progress_loss={metrics['source_semantic_progress_loss']:.4f}"
+            if "content_cross_attn_aux_loss" in metrics:
+                msg += f" content_cross_attn_aux_loss={metrics['content_cross_attn_aux_loss']:.4f}"
+            if "content_cross_attn_gate_mean" in metrics:
+                msg += f" content_cross_attn_gate_mean={metrics['content_cross_attn_gate_mean']:.4f}"
+            if "content_cross_attn_delta_ratio" in metrics:
+                msg += f" content_cross_attn_delta_ratio={metrics['content_cross_attn_delta_ratio']:.6f}"
             if "progress_stop_aux_loss" in metrics:
                 msg += f" progress_stop_aux_loss={metrics['progress_stop_aux_loss']:.4f}"
             if "speaker_side_gate_mean" in metrics:
@@ -3945,6 +4102,8 @@ def main() -> int:
     saw_nonzero_speaker_side_gate_grad = False
     saw_nonzero_speaker_cross_attn_grad = False
     saw_nonzero_speaker_cross_attn_gate_grad = False
+    saw_nonzero_content_cross_attn_grad = False
+    saw_nonzero_content_cross_attn_gate_grad = False
     last_lora_grad_norm = 0.0
     last_timbre_grad_norm = 0.0
     last_ref_speaker_prompt_grad_norm = 0.0
@@ -3957,6 +4116,8 @@ def main() -> int:
     last_speaker_side_gate_grad_norm = 0.0
     last_speaker_cross_attn_grad_norm = 0.0
     last_speaker_cross_attn_gate_grad_norm = 0.0
+    last_content_cross_attn_grad_norm = 0.0
+    last_content_cross_attn_gate_grad_norm = 0.0
     speaker_side_max_grad_norms: dict[str, dict[str, float]] = {
         "adaln": {},
         "kv_bias": {},
@@ -4012,12 +4173,20 @@ def main() -> int:
                         )
                         if callable(set_runtime_scale):
                             set_runtime_scale(alpha)
-                        active_config = getattr(accelerator.unwrap_model(model), "timbre_memory_config", None)
-                        if active_config is not None and hasattr(
-                            active_config,
-                            "speaker_cross_attn_runtime_scale_multiplier",
-                        ):
-                            active_config.speaker_cross_attn_runtime_scale_multiplier = float(alpha)
+                            active_config = getattr(accelerator.unwrap_model(model), "timbre_memory_config", None)
+                            if active_config is not None and hasattr(
+                                active_config,
+                                "speaker_cross_attn_runtime_scale_multiplier",
+                            ):
+                                active_config.speaker_cross_attn_runtime_scale_multiplier = float(alpha)
+                    if timbre_memory_config.content_cross_attn_enabled:
+                        set_content_step = getattr(
+                            accelerator.unwrap_model(model),
+                            "set_content_guided_attn_runtime_step",
+                            None,
+                        )
+                        if callable(set_content_step):
+                            set_content_step(global_step + 1)
                     forward_kwargs.update(
                         {
                             "source_ref_codes": batch.get("source_ref_codes"),
@@ -4064,6 +4233,8 @@ def main() -> int:
                 semantic_aux_stats: dict[str, float] = {}
                 source_semantic_aux_loss_value = None
                 source_semantic_aux_stats: dict[str, float] = {}
+                content_cross_attn_aux_loss_value = None
+                content_cross_attn_aux_stats: dict[str, float] = {}
                 ref_content_suppression_loss_value = None
                 ref_content_suppression_stats: dict[str, float] = {}
                 progress_stop_aux_loss_value = None
@@ -4092,6 +4263,16 @@ def main() -> int:
                     source_semantic_aux_stats = getattr(
                         unwrapped_for_stats,
                         "last_source_semantic_aux_stats",
+                        {},
+                    ) or {}
+                    content_cross_attn_aux_loss_value = getattr(
+                        unwrapped_for_stats,
+                        "last_content_cross_attn_aux_loss",
+                        None,
+                    )
+                    content_cross_attn_aux_stats = getattr(
+                        unwrapped_for_stats,
+                        "last_content_cross_attn_aux_stats",
                         {},
                     ) or {}
                     ref_content_suppression_loss_value = getattr(
@@ -4188,6 +4369,23 @@ def main() -> int:
                             speaker_cross_attn_gate_layer_grad_norms(model),
                         )
                         (
+                            last_content_cross_attn_grad_norm,
+                            has_nonzero_content_cross_attn,
+                        ) = named_fragment_grad_stats(
+                            model,
+                            ("content_cross_attn_encoder", "content_cross_attn_layers", "content_phoneme_classifier"),
+                        )
+                        saw_nonzero_content_cross_attn_grad = (
+                            saw_nonzero_content_cross_attn_grad or has_nonzero_content_cross_attn
+                        )
+                        (
+                            last_content_cross_attn_gate_grad_norm,
+                            has_nonzero_content_cross_attn_gate,
+                        ) = content_cross_attn_gate_grad_stats(model)
+                        saw_nonzero_content_cross_attn_gate_grad = (
+                            saw_nonzero_content_cross_attn_gate_grad or has_nonzero_content_cross_attn_gate
+                        )
+                        (
                             last_ref_speaker_prompt_grad_norm,
                             has_nonzero_ref_speaker_prompt,
                         ) = ref_speaker_prompt_grad_stats(model)
@@ -4267,6 +4465,17 @@ def main() -> int:
                                 last_content_ctc_head_grad_norm,
                                 global_step,
                             )
+                            if timbre_memory_config.content_cross_attn_enabled:
+                                tb_writer.add_scalar(
+                                    "train/content_cross_attn_grad_norm",
+                                    last_content_cross_attn_grad_norm,
+                                    global_step,
+                                )
+                                tb_writer.add_scalar(
+                                    "train/content_cross_attn_gate_grad_norm",
+                                    last_content_cross_attn_gate_grad_norm,
+                                    global_step,
+                                )
                             if timbre_memory_config.speaker_side_pathway_enabled:
                                 tb_writer.add_scalar(
                                     "train/speaker_side_adaln_grad_norm",
@@ -4341,6 +4550,14 @@ def main() -> int:
                                 )
                             for stat_name, stat_value in source_semantic_aux_stats.items():
                                 tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
+                            if content_cross_attn_aux_loss_value is not None:
+                                tb_writer.add_scalar(
+                                    "train/content_cross_attn_aux_loss",
+                                    float(content_cross_attn_aux_loss_value),
+                                    global_step,
+                                )
+                            for stat_name, stat_value in content_cross_attn_aux_stats.items():
+                                tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
                             for stat_name, stat_value in source_semantic_gate_delta_values.items():
                                 tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
                             if ref_content_suppression_loss_value is not None:
@@ -4379,6 +4596,9 @@ def main() -> int:
                         msg += f" timbre_adapter_grad_norm={last_timbre_grad_norm:.4f}"
                         msg += f" ref_speaker_prompt_grad_norm={last_ref_speaker_prompt_grad_norm:.6f}"
                         msg += f" source_semantic_grad_norm={last_source_semantic_grad_norm:.4f}"
+                        if timbre_memory_config.content_cross_attn_enabled:
+                            msg += f" content_cross_attn_grad_norm={last_content_cross_attn_grad_norm:.4f}"
+                            msg += f" content_cross_attn_gate_grad_norm={last_content_cross_attn_gate_grad_norm:.6f}"
                         msg += f" routing_gate_grad_norm={last_routing_gate_grad_norm:.6f}"
                         msg += f" source_semantic_gate_grad_norm={last_source_semantic_gate_grad_norm:.6f}"
                         msg += f" content_ctc_head_grad_norm={last_content_ctc_head_grad_norm:.6f}"
@@ -4416,6 +4636,16 @@ def main() -> int:
                             msg += f" semantic_aux_loss={float(semantic_aux_loss_value):.4f}"
                         if source_semantic_aux_loss_value is not None:
                             msg += f" source_semantic_aux_loss={float(source_semantic_aux_loss_value):.4f}"
+                        if content_cross_attn_aux_loss_value is not None:
+                            msg += f" content_cross_attn_aux_loss={float(content_cross_attn_aux_loss_value):.4f}"
+                        if "content_cross_attn_gate_mean" in content_cross_attn_aux_stats:
+                            msg += f" content_cross_attn_gate_mean={content_cross_attn_aux_stats['content_cross_attn_gate_mean']:.4f}"
+                        if "content_cross_attn_delta_ratio" in content_cross_attn_aux_stats:
+                            msg += f" content_cross_attn_delta_ratio={content_cross_attn_aux_stats['content_cross_attn_delta_ratio']:.6f}"
+                        if "content_guided_attn_loss" in content_cross_attn_aux_stats:
+                            msg += f" content_guided_attn_loss={content_cross_attn_aux_stats['content_guided_attn_loss']:.4f}"
+                        if "content_phoneme_classifier_loss" in content_cross_attn_aux_stats:
+                            msg += f" content_phoneme_loss={content_cross_attn_aux_stats['content_phoneme_classifier_loss']:.4f}"
                         if "source_semantic_gate_mean" in source_semantic_aux_stats:
                             msg += f" source_semantic_gate_mean={source_semantic_aux_stats['source_semantic_gate_mean']:.4f}"
                         if "source_semantic_delta_ratio" in source_semantic_aux_stats:
@@ -4573,6 +4803,11 @@ def main() -> int:
             raise RuntimeError("Smoke test failed: speaker cross-attn gradients are all zero")
         if not saw_nonzero_speaker_cross_attn_gate_grad:
             raise RuntimeError("Smoke test failed: speaker cross-attn gate gradients are all zero")
+    if args.smoke_test and timbre_memory_config.content_cross_attn_enabled:
+        if not saw_nonzero_content_cross_attn_grad:
+            raise RuntimeError("Smoke test failed: content cross-attn gradients are all zero")
+        if not saw_nonzero_content_cross_attn_gate_grad:
+            raise RuntimeError("Smoke test failed: content cross-attn gate gradients are all zero")
 
     accelerator.wait_for_everyone()
     if eval_loaders:
