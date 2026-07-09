@@ -799,6 +799,7 @@ class PersistentCodecVCInfer:
                     flush=True,
                 )
             source_semantic_encoder = getattr(self.model, "source_semantic_memory_encoder", None)
+            content_cross_attn_encoder = getattr(self.model, "content_cross_attn_encoder", None)
             text_gate = float(getattr(self.model.timbre_memory_config, "source_semantic_text_gate", 0.0))
             learned_text_gate = bool(
                 getattr(self.model.timbre_memory_config, "source_semantic_allow_learned_text_gate", False)
@@ -808,10 +809,16 @@ class PersistentCodecVCInfer:
                 or "hubert_continuous"
             ).strip().lower()
             source_content_memory_type = self.mod.normalize_source_content_memory_type(source_content_memory_type)
+            needs_source_content_features = source_semantic_encoder is not None or content_cross_attn_encoder is not None
             should_use_source_semantic = (
-                source_semantic_encoder is not None
+                needs_source_content_features
                 and not args.disable_source_semantic_memory
-                and (no_text or abs(text_gate) > 1.0e-6 or learned_text_gate)
+                and (
+                    no_text
+                    or abs(text_gate) > 1.0e-6
+                    or learned_text_gate
+                    or content_cross_attn_encoder is not None
+                )
             )
             if should_use_source_semantic:
                 if self.mod.is_continuous_source_memory_type(source_content_memory_type):
@@ -841,12 +848,13 @@ class PersistentCodecVCInfer:
                             downsample_stride=int(args.source_semantic_downsample_stride),
                         )
                         source_semantic_origin = f"online:{semantic_model_name}:layer{int(args.source_semantic_layer)}"
+                    expected_dim_attr = (
+                        "content_cross_attn_feature_dim"
+                        if source_semantic_encoder is None and content_cross_attn_encoder is not None
+                        else "source_semantic_feature_dim"
+                    )
                     expected_dim = int(
-                        getattr(
-                            self.model.timbre_memory_config,
-                            "source_semantic_feature_dim",
-                            source_semantic_features.shape[-1],
-                        )
+                        getattr(self.model.timbre_memory_config, expected_dim_attr, source_semantic_features.shape[-1])
                     )
                     if int(source_semantic_features.shape[-1]) != expected_dim:
                         raise ValueError(
