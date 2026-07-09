@@ -13,6 +13,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torchaudio
 from transformers import GenerationConfig
@@ -72,7 +73,60 @@ def checkpoint_timbre_side_only(model_path: str) -> bool:
             config = json.load(handle)
     except Exception:
         return False
-    return bool(config.get("timbre_side_only", False))
+    return bool(
+        config.get("timbre_side_only", False)
+        or config.get("speaker_side_pathway_enabled", False)
+        or config.get("speaker_cross_attn_enabled", False)
+    )
+
+
+def checkpoint_speaker_side_pathway(model_path: str) -> bool:
+    config_path = Path(model_path).expanduser() / "timbre_memory_config.json"
+    if not config_path.exists():
+        return False
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except Exception:
+        return False
+    return bool(config.get("speaker_side_pathway_enabled", False) or config.get("speaker_cross_attn_enabled", False))
+
+
+def checkpoint_progress_stop_enabled(model_path: str) -> bool:
+    config_path = Path(model_path).expanduser() / "timbre_memory_config.json"
+    if not config_path.exists():
+        return False
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except Exception:
+        return False
+    return float(config.get("progress_loss_weight", 0.0) or 0.0) > 0.0 or float(
+        config.get("stop_loss_weight", 0.0) or 0.0
+    ) > 0.0
+
+
+def load_speaker_seq_tensor(path: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    path_obj = Path(path).expanduser()
+    if not path_obj.exists():
+        raise FileNotFoundError(f"speaker_seq_path not found: {path_obj}")
+    if path_obj.suffix.lower() == ".npz":
+        payload = np.load(path_obj)
+        if "speaker_seq_features" in payload.files:
+            arr = payload["speaker_seq_features"]
+        elif "features" in payload.files:
+            arr = payload["features"]
+        else:
+            arr = payload[payload.files[0]]
+    else:
+        arr = np.load(path_obj)
+    tensor = torch.as_tensor(arr, dtype=torch.float32, device=device)
+    if tensor.dim() > 2:
+        tensor = tensor.reshape(-1, tensor.shape[-1])
+    if tensor.dim() != 2:
+        raise ValueError(f"speaker_seq_path must contain [T, D], got {tuple(tensor.shape)} from {path_obj}")
+    mask = torch.ones((1, tensor.shape[0]), dtype=torch.bool, device=device)
+    return tensor.unsqueeze(0), mask
 
 
 def load_infer_module():
@@ -119,6 +173,12 @@ def select_rows(rows: list[dict[str, Any]], args: argparse.Namespace) -> list[di
             continue
         if mode not in {"no_text", "text"}:
             continue
+        if (
+            args.filter_v2_real_no_text_ref_content_leak
+            and mode == "no_text"
+            and is_v2_real_no_text_ref_content_leak(row)
+        ):
+            continue
         cell_key = f"{mode}:{cell}"
         if args.per_mode > 0 and mode_counts[mode] >= args.per_mode:
             continue
@@ -153,6 +213,43 @@ def source_content_text_with_key(row: dict[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
+def nested_get(row: dict[str, Any], key: str) -> Any | None:
+    value = row.get(key)
+    if value not in (None, ""):
+        return value
+    meta = row.get("moss_codecvc_meta")
+    if isinstance(meta, dict):
+        value = meta.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def normalize_content_text(text: Any) -> str:
+    out: list[str] = []
+    for ch in str(text or "").lower():
+        code = ord(ch)
+        if ch.isalnum() or 0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF:
+            out.append(ch)
+    return "".join(out)
+
+
+def is_v2_real_no_text_ref_content_leak(row: dict[str, Any]) -> bool:
+    ref_text = normalize_content_text(nested_get(row, "timbre_ref_text"))
+    target_text = normalize_content_text(nested_get(row, "target_text"))
+    return bool(ref_text and target_text and ref_text == target_text)
+
+
+def audio_path_with_meta_fallback(row: dict[str, Any], key: str) -> str:
+    value = row.get(key)
+    if value:
+        return str(value)
+    meta = row.get("moss_codecvc_meta")
+    if isinstance(meta, dict) and meta.get(key):
+        return str(meta[key])
+    return ""
+
+
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -172,12 +269,14 @@ class PersistentCodecVCInfer:
         self.args = args
         set_generation_seed(args.seed)
         self.mod = load_infer_module()
+        self._source_semantic_online_cache: dict[tuple[str, str, bool, str, str], tuple[Any, torch.nn.Module, torch.dtype, int]] = {}
         cfg = self.mod.load_config(args.config)
         self.cfg = cfg
         self.n_vq = args.n_vq or int(self.mod.deep_get(cfg, "moss.default_n_vq", 32))
         self.mod.ensure_moss_on_path(self.mod.deep_get(cfg, "moss.root"))
         self.mod.patch_torchaudio_load_with_soundfile_fallback()
 
+        from moss_tts_delay.configuration_moss_tts import MossTTSDelayConfig
         from moss_tts_delay.modeling_moss_tts import MossTTSDelayModel
         from moss_tts_delay.processing_moss_tts import MossTTSDelayProcessor
         from peft import PeftConfig, PeftModel
@@ -211,11 +310,26 @@ class PersistentCodecVCInfer:
             trust_remote_code=True,
         )
         self.processor.audio_tokenizer.to(self.device)
-        model = MossTTSDelayModel.from_pretrained(
-            model_load_path,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-        )
+        model_load_kwargs = {
+            "torch_dtype": dtype,
+            "trust_remote_code": True,
+        }
+        if args.attn_implementation:
+            attn_impl = str(args.attn_implementation)
+            model_config = MossTTSDelayConfig.from_pretrained(model_load_path, trust_remote_code=True)
+            for cfg_obj in (model_config, getattr(model_config, "language_config", None)):
+                if cfg_obj is None:
+                    continue
+                setattr(cfg_obj, "_attn_implementation", attn_impl)
+                setattr(cfg_obj, "_attn_implementation_internal", attn_impl)
+                setattr(cfg_obj, "attn_implementation", attn_impl)
+            model_load_kwargs["config"] = model_config
+            model_load_kwargs["attn_implementation"] = attn_impl
+            print(
+                f"[persistent-infer] loading base model with attn_implementation={args.attn_implementation}",
+                flush=True,
+            )
+        model = MossTTSDelayModel.from_pretrained(model_load_path, **model_load_kwargs)
         if not hasattr(model, "prepare_inputs_for_generation"):
             model.prepare_inputs_for_generation = lambda *a, **kw: kw
         if not hasattr(model, "generation_config"):
@@ -251,6 +365,17 @@ class PersistentCodecVCInfer:
         print(f"[persistent-infer] moving model to {self.device}", flush=True)
         self.model = model.to(self.device).eval()
         print(f"[persistent-infer] model on {self.device}", flush=True)
+        timbre_cfg = getattr(self.model, "timbre_memory_config", None)
+        self.stop_head_budget = bool(
+            getattr(self.model, "progress_stop_head", None) is not None
+            and timbre_cfg is not None
+            and (
+                float(getattr(timbre_cfg, "progress_loss_weight", 0.0) or 0.0) > 0.0
+                or float(getattr(timbre_cfg, "stop_loss_weight", 0.0) or 0.0) > 0.0
+            )
+        )
+        if self.stop_head_budget:
+            print("[persistent-infer] stop-head budget enabled; min_audio_tokens will not force no-text length", flush=True)
         self.mod.apply_source_gate_floor_for_inference(self.model, args.source_gate_floor)
         monotonic_bias_strength = (
             0.0 if args.disable_source_semantic_monotonic_bias else args.source_semantic_monotonic_bias_strength
@@ -267,6 +392,82 @@ class PersistentCodecVCInfer:
             f"timbre_memory={self.use_timbre_memory} timbre_side_only={bool(args.timbre_side_only)}",
             flush=True,
         )
+
+    @torch.no_grad()
+    def _extract_source_semantic_features_online_cached(
+        self,
+        *,
+        audio_path: str,
+        model_name_or_path: str,
+        cache_dir: str,
+        local_files_only: bool,
+        layer: int,
+        device: str,
+        dtype_name: str,
+        downsample_stride: int,
+    ) -> torch.Tensor:
+        key = (
+            str(model_name_or_path),
+            str(Path(cache_dir).expanduser()),
+            bool(local_files_only),
+            str(device),
+            str(dtype_name),
+        )
+        cached = self._source_semantic_online_cache.get(key)
+        if cached is None:
+            from transformers import AutoFeatureExtractor, AutoModel, AutoProcessor
+
+            common = {
+                "cache_dir": str(Path(cache_dir).expanduser()),
+                "local_files_only": bool(local_files_only),
+                "trust_remote_code": True,
+            }
+            try:
+                processor = AutoProcessor.from_pretrained(model_name_or_path, **common)
+            except Exception:
+                processor = AutoFeatureExtractor.from_pretrained(model_name_or_path, **common)
+            dtype = self.mod._semantic_torch_dtype(dtype_name, device)
+            model = AutoModel.from_pretrained(model_name_or_path, dtype=dtype, use_safetensors=False, **common)
+            model.eval().to(device)
+            for param in model.parameters():
+                param.requires_grad = False
+            sr = self.mod._processor_sample_rate(processor)
+            cached = (processor, model, dtype, int(sr))
+            self._source_semantic_online_cache[key] = cached
+            print(
+                "[persistent-infer] cached source semantic extractor "
+                f"model={model_name_or_path} device={device} dtype={dtype} sr={int(sr)}",
+                flush=True,
+            )
+        processor, model, dtype, sr = cached
+        audio = self.mod._read_audio_mono_for_semantic(audio_path, sr)
+        inputs = processor(audio.numpy(), sampling_rate=sr, return_tensors="pt", padding=True)
+        model_inputs = {}
+        for name, value in inputs.items():
+            if torch.is_tensor(value):
+                if name == "input_values":
+                    value = value.to(device=device, dtype=dtype)
+                else:
+                    value = value.to(device=device)
+            model_inputs[name] = value
+        outputs = model(**model_inputs, output_hidden_states=True)
+        if int(layer) == -1 or getattr(outputs, "hidden_states", None) is None:
+            features = outputs.last_hidden_state
+        else:
+            hidden_states = outputs.hidden_states
+            idx = int(layer)
+            if idx < 0:
+                idx = len(hidden_states) + idx
+            if idx < 0 or idx >= len(hidden_states):
+                raise ValueError(f"source semantic layer {layer} outside hidden_states={len(hidden_states)}")
+            features = hidden_states[idx]
+        features = features.squeeze(0).detach().float().cpu()
+        stride = max(1, int(downsample_stride))
+        if stride > 1:
+            features = features[::stride].contiguous()
+        if features.dim() != 2 or features.numel() == 0:
+            raise RuntimeError(f"empty source semantic features for {audio_path}: shape={tuple(features.shape)}")
+        return features.contiguous()
 
     def _gen_kwargs(
         self,
@@ -344,6 +545,12 @@ class PersistentCodecVCInfer:
             min_audio_tokens = int(source_codes.shape[0])
         else:
             min_audio_tokens = 0
+        stop_head_budget_active = bool(self.stop_head_budget and self.use_timbre_memory)
+        if stop_head_budget_active:
+            if args.min_new_tokens is None:
+                min_new_tokens = 0
+            if args.min_audio_tokens is None:
+                min_audio_tokens = 0
 
         audio_temperature = args.no_text_audio_temperature if no_text and args.no_text_audio_temperature is not None else args.audio_temperature
         audio_top_p = args.no_text_audio_top_p if no_text and args.no_text_audio_top_p is not None else args.audio_top_p
@@ -383,7 +590,9 @@ class PersistentCodecVCInfer:
             "[persistent-infer] generation budget "
             f"max_new_tokens={max_new_tokens} ({reason}) "
             f"min_new_tokens={min_new_tokens} min_audio_tokens={min_audio_tokens} "
-            f"audio_top_k={gen_kwargs['audio_top_k']}",
+            f"stop_head_budget={int(stop_head_budget_active)} "
+            f"audio_top_k={gen_kwargs['audio_top_k']} "
+            f"timbre_cfg_scale={float(args.timbre_cfg_scale):.3f}",
             flush=True,
         )
         return gen_kwargs, min_new_tokens, min_audio_tokens
@@ -392,8 +601,19 @@ class PersistentCodecVCInfer:
         args = self.args
         mode = str(row.get("mode") or "")
         no_text = mode == "no_text"
-        source_audio = str(row.get("source_audio") or "")
-        timbre_ref_audio = str(row.get("timbre_ref_audio") or "")
+        source_audio = audio_path_with_meta_fallback(row, "source_audio")
+        timbre_ref_audio = audio_path_with_meta_fallback(row, "timbre_ref_audio")
+        speaker_vec_path = str(row.get("speaker_vec_path") or row.get("timbre_ref_speaker_vec_path") or "")
+        if args.speaker_vec_path:
+            speaker_vec_path = str(args.speaker_vec_path)
+        speaker_seq_path = str(
+            row.get("speaker_seq_path")
+            or row.get("timbre_ref_speaker_seq_path")
+            or row.get("speaker_seq_features_path")
+            or ""
+        )
+        if args.speaker_seq_path:
+            speaker_seq_path = str(args.speaker_seq_path)
         if not source_audio or not Path(source_audio).exists():
             raise FileNotFoundError(f"source_audio not found: {source_audio}")
         if not timbre_ref_audio or not Path(timbre_ref_audio).exists():
@@ -422,7 +642,63 @@ class PersistentCodecVCInfer:
             )
         instruction = self.mod.apply_vc_mode_token(instruction, vc_mode, enabled=not args.disable_mode_token)
         prompt_text = args.no_text_placeholder if no_text else text
-        prompt_references = [source_codes] if args.timbre_side_only else [source_codes, timbre_codes]
+        ref_prompt_slot_enabled, ref_prompt_slot_tokens = (
+            self.mod.resolve_ref_speaker_prompt_slot(args, self.model) if self.use_timbre_memory else (False, 0)
+        )
+        ref_prompt_permutation = (
+            self.mod.resolve_ref_prompt_codec_permutation(args, self.model)
+            if self.use_timbre_memory
+            else {
+                "enabled": False,
+                "min_seconds": 2.0,
+                "max_seconds": 4.0,
+                "frame_rate": 12.5,
+                "seed": 1234,
+                "mode": "shuffle",
+                "block_seconds": 0.4,
+                "bootstrap": "off",
+            }
+        )
+        ref_prompt_slot_codes = None
+        if ref_prompt_slot_enabled:
+            ref_prompt_slot_codes = self.mod.make_ref_speaker_prompt_slot_codes(
+                source_codes,
+                n_vq=self.n_vq,
+                audio_pad_code=int(self.model.config.audio_pad_code),
+                token_count=ref_prompt_slot_tokens,
+                slot_code=int(getattr(self.model.timbre_memory_config, "ref_speaker_prompt_slot_code", -1)),
+                slot_pack_mode=str(getattr(self.model.timbre_memory_config, "ref_speaker_prompt_slot_pack_mode", "pad")),
+            )
+        timbre_prompt_codes = timbre_codes
+        ref_prompt_permutation_stats = {
+            "enabled": 0,
+            "source_frames": int(timbre_codes.shape[0]),
+            "prompt_frames": int(timbre_codes.shape[0]),
+            "start": 0,
+            "shuffled": 0,
+        }
+        should_permute_ref_prompt = (
+            bool(ref_prompt_permutation["enabled"])
+            and ref_prompt_slot_codes is None
+            and not bool(args.timbre_side_only)
+        )
+        if should_permute_ref_prompt:
+            timbre_prompt_codes, stats = self.mod.permute_ref_prompt_codes(
+                timbre_codes,
+                enabled=True,
+                min_seconds=float(ref_prompt_permutation["min_seconds"]),
+                max_seconds=float(ref_prompt_permutation["max_seconds"]),
+                frame_rate=float(ref_prompt_permutation["frame_rate"]),
+                seed=int(ref_prompt_permutation["seed"]),
+                mode=str(ref_prompt_permutation["mode"]),
+                block_seconds=float(ref_prompt_permutation["block_seconds"]),
+                bootstrap=str(ref_prompt_permutation.get("bootstrap", "off")),
+            )
+            ref_prompt_permutation_stats = stats.as_dict()
+        if ref_prompt_slot_codes is not None:
+            prompt_references = [source_codes, ref_prompt_slot_codes]
+        else:
+            prompt_references = [source_codes] if args.timbre_side_only else [source_codes, timbre_prompt_codes]
         user_message = self.processor.build_user_message(
             text=prompt_text,
             reference=prompt_references,
@@ -444,10 +720,17 @@ class PersistentCodecVCInfer:
             "[persistent-infer] encoded codec shapes "
             f"case={row.get('case_id')} source={tuple(source_codes.shape)} "
             f"timbre_ref={tuple(timbre_codes.shape)} prompt_refs={len(prompt_references)} "
-            f"timbre_side_only={bool(args.timbre_side_only)} prompt={tuple(inputs['input_ids'].shape)}",
+            f"timbre_side_only={bool(args.timbre_side_only)} ref_prompt_slot={bool(ref_prompt_slot_enabled)} "
+            f"ref_prompt_permutation_enabled={bool(ref_prompt_permutation['enabled'])} "
+            f"ref_prompt_permutation_applied={bool(should_permute_ref_prompt)} "
+            f"ref_prompt_permutation_mode={ref_prompt_permutation['mode']} "
+            f"ref_prompt_permutation_block_seconds={float(ref_prompt_permutation['block_seconds']):.3f} "
+            f"ref_prompt_permutation_stats={ref_prompt_permutation_stats} "
+            f"prompt={tuple(inputs['input_ids'].shape)}",
             flush=True,
         )
         if self.use_timbre_memory:
+            gen_kwargs["timbre_cfg_scale"] = float(args.timbre_cfg_scale)
             mode_id = int(getattr(self.model, "MODE_TO_ID", {}).get(vc_mode, 0))
             if mode_id > 0:
                 gen_kwargs["vc_mode_id"] = torch.tensor([mode_id], dtype=torch.long, device=self.device)
@@ -464,12 +747,52 @@ class PersistentCodecVCInfer:
             )
             if args.timbre_ref_speaker_embedding_path:
                 gen_kwargs["timbre_ref_speaker_embedding_path"] = [args.timbre_ref_speaker_embedding_path]
+            if speaker_vec_path:
+                gen_kwargs["speaker_vec_path"] = [speaker_vec_path]
+            cross_source = str(
+                getattr(self.model.timbre_memory_config, "speaker_cross_attn_source", "vector") or "vector"
+            ).strip().lower()
+            if cross_source == "sequence" and not speaker_seq_path:
+                raise ValueError(
+                    f"checkpoint expects speaker_cross_attn_source=sequence but row has no speaker_seq_path: "
+                    f"{row.get('case_id')}"
+                )
+            if speaker_seq_path:
+                speaker_seq_features, speaker_seq_mask = load_speaker_seq_tensor(speaker_seq_path, self.device)
+                gen_kwargs["speaker_seq_features"] = speaker_seq_features
+                gen_kwargs["speaker_seq_features_mask"] = speaker_seq_mask
             gen_kwargs["timbre_ref_speaker_audio_path"] = [timbre_ref_audio]
+            if int(args.ref_speaker_prompt_attention_capture_frames) > 0:
+                gen_kwargs["ref_speaker_prompt_attention_capture_frames"] = int(
+                    args.ref_speaker_prompt_attention_capture_frames
+                )
+                gen_kwargs["ref_speaker_prompt_attention_layers"] = str(args.ref_speaker_prompt_attention_layers)
             if getattr(self.model.timbre_memory_config, "use_role_routing", False):
                 prompt_role_ids = self.mod.infer_prompt_role_ids_from_audio_spans(
                     inputs["input_ids"],
                     audio_pad_code=int(self.model.config.audio_pad_code),
                 )
+                if ref_prompt_slot_enabled:
+                    slot_positions = self.mod.ref_speaker_prompt_slot_positions(
+                        inputs["input_ids"],
+                        audio_start_token_id=int(self.model.config.audio_start_token_id),
+                        audio_end_token_id=int(self.model.config.audio_end_token_id),
+                        audio_gen_slot_token_id=(
+                            int(getattr(self.model.config, "audio_user_slot_token_id", self.model.config.audio_assistant_gen_slot_token_id)),
+                            int(self.model.config.audio_assistant_gen_slot_token_id),
+                        ),
+                        token_count=int(ref_prompt_slot_tokens),
+                        occurrence=2,
+                    )
+                    prompt_role_ids = prompt_role_ids.clone()
+                    prompt_role_ids[slot_positions.to(device=prompt_role_ids.device).bool()] = self.mod.REF_CODEC
+                    gen_kwargs["ref_speaker_prompt_slot_positions"] = slot_positions.to(self.device)
+                    print(
+                        "[persistent-infer] ref speaker prompt slot "
+                        f"tokens={ref_prompt_slot_tokens} positions={int(slot_positions.sum().item())}",
+                        flush=True,
+                    )
+                gen_kwargs["role_ids"] = prompt_role_ids.to(self.device)
                 print(
                     "[persistent-infer] role routing "
                     f"counts={self.mod.count_roles(prompt_role_ids).as_dict()}",
@@ -507,7 +830,7 @@ class PersistentCodecVCInfer:
                             source_content_memory_type,
                             args.source_semantic_model_name_or_path,
                         )
-                        source_semantic_features = self.mod.extract_source_semantic_features_online(
+                        source_semantic_features = self._extract_source_semantic_features_online_cached(
                             audio_path=source_audio,
                             model_name_or_path=semantic_model_name,
                             cache_dir=args.source_semantic_cache_dir,
@@ -609,6 +932,24 @@ class PersistentCodecVCInfer:
 
         with torch.inference_mode():
             output = self.model.generate(**inputs, **gen_kwargs)
+        generation_ids_path = ""
+        if args.save_generation_ids_dir:
+            generation_ids_dir = Path(args.save_generation_ids_dir).expanduser()
+            generation_ids_dir.mkdir(parents=True, exist_ok=True)
+            generation_ids_path = str(generation_ids_dir / f"{safe_stem(str(row.get('case_id') or 'case'))}.pt")
+            torch.save(
+                {
+                    "case_id": row.get("case_id"),
+                    "mode": row.get("mode"),
+                    "cell": row.get("cell"),
+                    "timbre_cfg_scale": float(args.timbre_cfg_scale),
+                    "output": [
+                        (int(start_length), cur_generation_ids.detach().cpu())
+                        for start_length, cur_generation_ids in output
+                    ],
+                },
+                generation_ids_path,
+            )
         generation_stats = self.mod.generation_structure_stats(
             output,
             processor=self.processor,
@@ -653,12 +994,30 @@ class PersistentCodecVCInfer:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         first_stats = generation_stats[0] if generation_stats else {}
-        return {
+        result = {
             "generation_max_new_tokens": int(gen_kwargs.get("max_new_tokens", 0)),
             "generation_min_new_tokens": int(min_new_tokens),
             "generation_min_audio_tokens": int(min_audio_tokens),
+            "generation_stop_head_budget": bool(self.stop_head_budget),
             "generation_structure": first_stats,
+            "timbre_cfg_scale": float(args.timbre_cfg_scale),
+            "speaker_vec_path": speaker_vec_path,
+            "speaker_seq_path": speaker_seq_path,
+            "ref_prompt_codec_permutation": ref_prompt_permutation_stats,
+            "ref_prompt_codec_permutation_applied": bool(should_permute_ref_prompt),
         }
+        if generation_ids_path:
+            result["generation_ids_path"] = generation_ids_path
+        ref_slot_attn = getattr(self.model, "last_ref_speaker_prompt_attention_stats", {}) or {}
+        if ref_slot_attn:
+            result["ref_speaker_prompt_attention_stats"] = ref_slot_attn
+        ref_slot_embed = getattr(self.model, "last_ref_speaker_prompt_slot_stats", {}) or {}
+        if ref_slot_embed:
+            result["ref_speaker_prompt_slot_stats"] = ref_slot_embed
+        progress_stop_infer = getattr(self.model, "last_progress_stop_infer_stats", {}) or {}
+        if progress_stop_infer:
+            result["progress_stop_infer_stats"] = progress_stop_infer
+        return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -676,6 +1035,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--shard-index", type=int, default=0)
     ap.add_argument("--case-id", action="append", default=[])
+    ap.add_argument(
+        "--filter-v2-real-no-text-ref-content-leak",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("FILTER_V2_REAL_NO_TEXT_REF_CONTENT_LEAK", True),
+        help="Skip no-text rows whose timbre_ref_text normalizes exactly to target_text.",
+    )
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--fail-fast", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -714,15 +1079,42 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--source-gate-floor", type=float, default=env_float("NO_TEXT_SOURCE_GATE_FLOOR", None))
     ap.add_argument("--disable-timbre-memory", action="store_true", default=env_bool("DISABLE_TIMBRE_MEMORY", False))
     ap.add_argument("--timbre-side-only", action=argparse.BooleanOptionalAction, default=env_bool_or_none("TIMBRE_SIDE_ONLY"))
-    ap.add_argument("--speaker-encoder-type", default=env_str("SPEAKER_ENCODER_TYPE", "speechbrain_ecapa"))
-    ap.add_argument("--speaker-encoder-path", default=env_str("SPEAKER_ENCODER_PATH", str(DEFAULT_SPEAKER_ENCODER)))
-    ap.add_argument("--speaker-embedding-dim", type=int, default=env_int("SPEAKER_EMBEDDING_DIM", 192))
+    ap.add_argument("--ref-prompt-codec-permutation", action=argparse.BooleanOptionalAction, default=env_bool_or_none("REF_PROMPT_CODEC_PERMUTATION"))
+    ap.add_argument("--ref-prompt-codec-permutation-min-seconds", type=float, default=env_float("REF_PROMPT_CODEC_PERMUTATION_MIN_SECONDS", None))
+    ap.add_argument("--ref-prompt-codec-permutation-max-seconds", type=float, default=env_float("REF_PROMPT_CODEC_PERMUTATION_MAX_SECONDS", None))
+    ap.add_argument("--ref-prompt-codec-permutation-frame-rate", type=float, default=env_float("REF_PROMPT_CODEC_PERMUTATION_FRAME_RATE", None))
+    ap.add_argument("--ref-prompt-codec-permutation-seed", type=int, default=env_int("REF_PROMPT_CODEC_PERMUTATION_SEED", None))
+    ap.add_argument("--ref-prompt-codec-permutation-mode", choices=("shuffle", "contiguous", "block_shuffle"), default=env_str("REF_PROMPT_CODEC_PERMUTATION_MODE", None))
+    ap.add_argument("--ref-prompt-codec-permutation-block-seconds", type=float, default=env_float("REF_PROMPT_CODEC_PERMUTATION_BLOCK_SECONDS", None))
+    ap.add_argument("--ref-prompt-codec-permutation-bootstrap", choices=("off", "block"), default=env_str("REF_PROMPT_CODEC_PERMUTATION_BOOTSTRAP", None))
+    ap.add_argument("--ref-speaker-prompt-slot", action=argparse.BooleanOptionalAction, default=env_bool_or_none("REF_SPEAKER_PROMPT_SLOT"))
+    ap.add_argument("--ref-speaker-prompt-tokens", type=int, default=env_int("REF_SPEAKER_PROMPT_TOKENS", None))
+    ap.add_argument("--ref-speaker-prompt-attention-capture-frames", type=int, default=env_int("REF_SPEAKER_PROMPT_ATTENTION_CAPTURE_FRAMES", 0))
+    ap.add_argument("--ref-speaker-prompt-attention-layers", default=env_str("REF_SPEAKER_PROMPT_ATTENTION_LAYERS", "-4,-3,-2,-1"))
+    ap.add_argument(
+        "--attn-implementation",
+        default=env_str("MOSS_TTS_ATTN_IMPLEMENTATION", ""),
+        help="Optional HF attention backend override for diagnostics, e.g. eager for output_attentions.",
+    )
+    ap.add_argument("--speaker-encoder-type", default=env_str("SPEAKER_ENCODER_TYPE", ""))
+    ap.add_argument("--speaker-encoder-path", default=env_str("SPEAKER_ENCODER_PATH", ""))
+    ap.add_argument("--speaker-embedding-dim", type=int, default=env_int("SPEAKER_EMBEDDING_DIM", None))
     ap.add_argument("--timbre-ref-speaker-embedding-path", default=env_str("TIMBRE_REF_SPEAKER_EMBEDDING_PATH", ""))
+    ap.add_argument("--speaker-vec-path", default=env_str("SPEAKER_VEC_PATH", ""))
+    ap.add_argument("--speaker-seq-path", default=env_str("SPEAKER_SEQ_PATH", ""))
     ap.add_argument("--language", default=env_str("LANGUAGE", None))
     ap.add_argument("--instruction", default=env_str("INSTRUCTION", None))
     ap.add_argument("--disable-mode-token", action="store_true", default=env_bool("DISABLE_MODE_TOKEN", False))
     ap.add_argument("--audio-segment-policy", choices=("all", "first", "longest"), default=env_str("AUDIO_SEGMENT_POLICY", "all"))
     ap.add_argument("--disable-source-semantic-memory", action="store_true", default=env_bool("DISABLE_SOURCE_SEMANTIC_MEMORY", False))
+    ap.add_argument(
+        "--timbre-cfg-scale",
+        "--cfg-scale",
+        dest="timbre_cfg_scale",
+        type=float,
+        default=env_float("TIMBRE_CFG_SCALE", 1.0),
+        help="Classifier-free guidance scale for S2 speaker conditioning.",
+    )
     ap.add_argument("--source-semantic-feature-path", default=env_str("SOURCE_SEMANTIC_FEATURE_PATH", ""))
     ap.add_argument("--source-content-token-ids", default=env_str("SOURCE_CONTENT_TOKEN_IDS", ""))
     ap.add_argument("--source-content-token-ids-path", default=env_str("SOURCE_CONTENT_TOKEN_IDS_PATH", ""))
@@ -742,6 +1134,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--source-semantic-release-after-progress", action="store_true", default=env_bool("SOURCE_SEMANTIC_RELEASE_AFTER_PROGRESS", False))
     ap.add_argument("--source-semantic-release-start", type=float, default=env_float("SOURCE_SEMANTIC_RELEASE_START", 1.0))
     ap.add_argument("--debug-generation-structure", action="store_true", default=env_bool("DEBUG_GENERATION_STRUCTURE", False))
+    ap.add_argument("--save-generation-ids-dir", default=env_str("SAVE_GENERATION_IDS_DIR", ""))
     args = ap.parse_args()
     if args.num_shards < 1:
         ap.error("--num-shards must be >= 1")
@@ -749,6 +1142,12 @@ def parse_args() -> argparse.Namespace:
         ap.error("--shard-index must be in [0, --num-shards)")
     if args.timbre_side_only is None:
         args.timbre_side_only = checkpoint_timbre_side_only(args.model_path)
+    if not args.speaker_encoder_type and not checkpoint_speaker_side_pathway(args.model_path):
+        args.speaker_encoder_type = "speechbrain_ecapa"
+    if not args.speaker_encoder_path and args.speaker_encoder_type == "speechbrain_ecapa":
+        args.speaker_encoder_path = str(DEFAULT_SPEAKER_ENCODER)
+    if args.speaker_embedding_dim is None and args.speaker_encoder_type == "speechbrain_ecapa":
+        args.speaker_embedding_dim = 192
     if not args.source_semantic_model_name_or_path:
         args.source_semantic_model_name_or_path = str(load_infer_module().DEFAULT_HUBERT_MODEL)
     if not args.source_semantic_cache_dir:
@@ -788,12 +1187,16 @@ def main() -> int:
         case_id = str(row.get("case_id") or "")
         output_wav = output_dir / f"{safe_stem(case_id)}.wav"
         content_text, content_text_key = source_content_text_with_key(row)
+        source_audio = audio_path_with_meta_fallback(row, "source_audio")
+        timbre_ref_audio = audio_path_with_meta_fallback(row, "timbre_ref_audio")
+        target_audio = audio_path_with_meta_fallback(row, "target_audio")
         manifest_row = {
             "case_id": case_id,
             "mode": row.get("mode"),
             "cell": row.get("cell"),
-            "source_audio": row.get("source_audio"),
-            "timbre_ref_audio": row.get("timbre_ref_audio"),
+            "source_audio": source_audio,
+            "timbre_ref_audio": timbre_ref_audio,
+            "target_audio": target_audio,
             "text": row.get("text"),
             "content_ref_text": row.get("content_ref_text"),
             "source_content_text": content_text,

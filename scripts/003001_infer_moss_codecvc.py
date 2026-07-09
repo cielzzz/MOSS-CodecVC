@@ -51,7 +51,8 @@ from moss_codecvc.models.moss_codecvc_wrapper import (
 )
 from moss_codecvc.moss_codec import ensure_moss_on_path
 from moss_codecvc.modes import VC_MODE_NO_TEXT, VC_MODE_TEXT, VC_NO_TEXT_PLACEHOLDER, apply_vc_mode_token
-from moss_codecvc.roles import SOURCE_CODEC, count_roles, infer_prompt_role_ids_from_audio_spans
+from moss_codecvc.ref_prompt_permutation import permute_ref_prompt_codes
+from moss_codecvc.roles import REF_CODEC, SOURCE_CODEC, count_roles, infer_prompt_role_ids_from_audio_spans, ref_speaker_prompt_slot_positions
 
 
 def patch_torchaudio_load_with_soundfile_fallback() -> None:
@@ -90,6 +91,132 @@ def patch_torchaudio_load_with_soundfile_fallback() -> None:
 
     torchaudio.load = safe_load
     torchaudio.save = safe_save
+
+
+def make_ref_speaker_prompt_slot_codes(
+    source_codes: torch.Tensor,
+    *,
+    n_vq: int,
+    audio_pad_code: int,
+    token_count: int,
+    slot_code: int = -1,
+    slot_pack_mode: str = "pad",
+) -> torch.Tensor:
+    fill_value = int(audio_pad_code) if int(slot_code) < 0 else int(slot_code)
+    slot_codes = torch.full(
+        (max(0, int(token_count)), int(n_vq)),
+        fill_value,
+        dtype=torch.long,
+        device=source_codes.device,
+    )
+    if str(slot_pack_mode or "pad").strip().lower() in {"audio_like", "audio-like", "active"}:
+        slot_codes.fill_(int(audio_pad_code))
+        slot_codes[:, 0] = int(0 if int(slot_code) < 0 else int(slot_code))
+    return slot_codes
+
+
+def resolve_ref_speaker_prompt_slot(args: argparse.Namespace, model) -> tuple[bool, int]:
+    cfg = getattr(model, "timbre_memory_config", None)
+    cfg_slot = bool(getattr(cfg, "ref_speaker_prompt_slot", False))
+    cfg_tokens = int(getattr(cfg, "ref_speaker_prompt_tokens", 0) or 0)
+    enabled = cfg_slot if args.ref_speaker_prompt_slot is None else bool(args.ref_speaker_prompt_slot)
+    tokens = cfg_tokens if args.ref_speaker_prompt_tokens is None else int(args.ref_speaker_prompt_tokens)
+    return bool(enabled and tokens > 0), max(0, tokens)
+
+
+def checkpoint_timbre_memory_config(model_path: str | Path) -> dict[str, object]:
+    config_path = Path(model_path).expanduser() / "timbre_memory_config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _model_timbre_config_dict(model) -> dict[str, object]:
+    cfg = getattr(model, "timbre_memory_config", None)
+    if cfg is None:
+        return {}
+    if hasattr(cfg, "__dataclass_fields__"):
+        return {name: getattr(cfg, name) for name in cfg.__dataclass_fields__}
+    if isinstance(cfg, dict):
+        return dict(cfg)
+    return {
+        name: getattr(cfg, name)
+        for name in dir(cfg)
+        if name.startswith("ref_prompt_codec_permutation")
+    }
+
+
+def env_bool_or_none(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_float_or_none(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return float(value)
+
+
+def env_int_or_none(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return int(value)
+
+
+def env_str_or_none(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value).strip()
+
+
+def resolve_ref_prompt_codec_permutation(args: argparse.Namespace, model) -> dict[str, object]:
+    cfg = _model_timbre_config_dict(model)
+    enabled = bool(cfg.get("ref_prompt_codec_permutation_enabled", False))
+    if getattr(args, "ref_prompt_codec_permutation", None) is not None:
+        enabled = bool(args.ref_prompt_codec_permutation)
+    min_seconds = float(cfg.get("ref_prompt_codec_permutation_min_seconds", 2.0))
+    if getattr(args, "ref_prompt_codec_permutation_min_seconds", None) is not None:
+        min_seconds = float(args.ref_prompt_codec_permutation_min_seconds)
+    max_seconds = float(cfg.get("ref_prompt_codec_permutation_max_seconds", 4.0))
+    if getattr(args, "ref_prompt_codec_permutation_max_seconds", None) is not None:
+        max_seconds = float(args.ref_prompt_codec_permutation_max_seconds)
+    frame_rate = float(cfg.get("ref_prompt_codec_permutation_frame_rate", 12.5))
+    if getattr(args, "ref_prompt_codec_permutation_frame_rate", None) is not None:
+        frame_rate = float(args.ref_prompt_codec_permutation_frame_rate)
+    seed = cfg.get("ref_prompt_codec_permutation_seed", 1234)
+    if getattr(args, "ref_prompt_codec_permutation_seed", None) is not None:
+        seed = args.ref_prompt_codec_permutation_seed
+    if seed is None:
+        seed = 1234
+    mode = str(cfg.get("ref_prompt_codec_permutation_mode", "shuffle"))
+    if getattr(args, "ref_prompt_codec_permutation_mode", None) is not None:
+        mode = str(args.ref_prompt_codec_permutation_mode)
+    block_seconds = float(cfg.get("ref_prompt_codec_permutation_block_seconds", 0.4))
+    if getattr(args, "ref_prompt_codec_permutation_block_seconds", None) is not None:
+        block_seconds = float(args.ref_prompt_codec_permutation_block_seconds)
+    bootstrap = str(cfg.get("ref_prompt_codec_permutation_bootstrap", "off"))
+    if getattr(args, "ref_prompt_codec_permutation_bootstrap", None) is not None:
+        bootstrap = str(args.ref_prompt_codec_permutation_bootstrap)
+    return {
+        "enabled": bool(enabled),
+        "min_seconds": max(0.0, float(min_seconds)),
+        "max_seconds": max(float(min_seconds), float(max_seconds)),
+        "frame_rate": max(1.0e-6, float(frame_rate)),
+        "seed": int(seed),
+        "mode": mode,
+        "block_seconds": max(0.0, float(block_seconds)),
+        "bootstrap": bootstrap,
+    }
 
 
 def normalize_device_arg(device_arg: str) -> str:
@@ -788,6 +915,49 @@ def main() -> int:
         default=False,
         help="Do not include timbre_ref_audio codec in the AR prompt; use it only through timbre memory/speaker conditioning.",
     )
+    ap.add_argument(
+        "--timbre-cfg-scale",
+        "--cfg-scale",
+        dest="timbre_cfg_scale",
+        type=float,
+        default=env_float_or_none("TIMBRE_CFG_SCALE"),
+        help="Classifier-free guidance scale for S2 speaker conditioning. 1.0 keeps the normal conditioned path.",
+    )
+    ap.add_argument(
+        "--ref-prompt-codec-permutation",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool_or_none("REF_PROMPT_CODEC_PERMUTATION"),
+        help="Use checkpoint/env-gated 1d C_ref prompt slice+frame permutation. Defaults to adapter config.",
+    )
+    ap.add_argument("--ref-prompt-codec-permutation-min-seconds", type=float, default=env_float_or_none("REF_PROMPT_CODEC_PERMUTATION_MIN_SECONDS"))
+    ap.add_argument("--ref-prompt-codec-permutation-max-seconds", type=float, default=env_float_or_none("REF_PROMPT_CODEC_PERMUTATION_MAX_SECONDS"))
+    ap.add_argument("--ref-prompt-codec-permutation-frame-rate", type=float, default=env_float_or_none("REF_PROMPT_CODEC_PERMUTATION_FRAME_RATE"))
+    ap.add_argument("--ref-prompt-codec-permutation-mode", choices=("shuffle", "contiguous", "block_shuffle"), default=env_str_or_none("REF_PROMPT_CODEC_PERMUTATION_MODE"))
+    ap.add_argument("--ref-prompt-codec-permutation-block-seconds", type=float, default=env_float_or_none("REF_PROMPT_CODEC_PERMUTATION_BLOCK_SECONDS"))
+    ap.add_argument(
+        "--ref-prompt-codec-permutation-bootstrap",
+        choices=("off", "block"),
+        default=env_str_or_none("REF_PROMPT_CODEC_PERMUTATION_BOOTSTRAP"),
+        help="When requested prompt frames exceed available C_ref frames, extend by block bootstrap.",
+    )
+    ap.add_argument(
+        "--ref-prompt-codec-permutation-seed",
+        type=int,
+        default=env_int_or_none("REF_PROMPT_CODEC_PERMUTATION_SEED"),
+        help="Fixed seed for reproducible inference-side C_ref prompt permutation. Defaults to 1234.",
+    )
+    ap.add_argument(
+        "--ref-speaker-prompt-slot",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Insert a fake S2 prompt slot and let the wrapper overwrite it with E_ref soft speaker tokens. Defaults to adapter config.",
+    )
+    ap.add_argument(
+        "--ref-speaker-prompt-tokens",
+        type=int,
+        default=None,
+        help="Number of fake S2 prompt-slot tokens. Defaults to adapter config.",
+    )
     ap.add_argument("--output-wav", required=True)
     ap.add_argument(
         "--output-generated-codec",
@@ -991,6 +1161,11 @@ def main() -> int:
         action="store_true",
         help="Print generated delayed-codec text/audio segment diagnostics before decoding.",
     )
+    ap.add_argument(
+        "--attn-implementation",
+        default="",
+        help="Optional HF attention backend override for diagnostics, e.g. eager for output_attentions.",
+    )
     args = ap.parse_args()
     set_generation_seed(args.seed)
 
@@ -1001,6 +1176,7 @@ def main() -> int:
     ensure_moss_on_path(moss_root)
     patch_torchaudio_load_with_soundfile_fallback()
 
+    from moss_tts_delay.configuration_moss_tts import MossTTSDelayConfig
     from moss_tts_delay.modeling_moss_tts import MossTTSDelayModel
     from moss_tts_delay.processing_moss_tts import MossTTSDelayProcessor
     from peft import PeftConfig, PeftModel
@@ -1029,11 +1205,23 @@ def main() -> int:
         trust_remote_code=True,
     )
     processor.audio_tokenizer.to(device)
-    model = MossTTSDelayModel.from_pretrained(
-        model_load_path,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    )
+    model_load_kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+    }
+    if args.attn_implementation:
+        attn_impl = str(args.attn_implementation)
+        model_config = MossTTSDelayConfig.from_pretrained(model_load_path, trust_remote_code=True)
+        for cfg_obj in (model_config, getattr(model_config, "language_config", None)):
+            if cfg_obj is None:
+                continue
+            setattr(cfg_obj, "_attn_implementation", attn_impl)
+            setattr(cfg_obj, "_attn_implementation_internal", attn_impl)
+            setattr(cfg_obj, "attn_implementation", attn_impl)
+        model_load_kwargs["config"] = model_config
+        model_load_kwargs["attn_implementation"] = attn_impl
+        print(f"[infer] loading base model with attn_implementation={args.attn_implementation}")
+    model = MossTTSDelayModel.from_pretrained(model_load_path, **model_load_kwargs)
     if not hasattr(model, "prepare_inputs_for_generation"):
         model.prepare_inputs_for_generation = lambda *a, **kw: kw
     if not hasattr(model, "generation_config"):
@@ -1092,7 +1280,58 @@ def main() -> int:
         )
     instruction = apply_vc_mode_token(instruction, vc_mode, enabled=not args.disable_mode_token)
     prompt_text = args.no_text_placeholder if args.no_text else args.text
-    prompt_references = [source_codes] if args.timbre_side_only else [source_codes, timbre_codes]
+    ref_prompt_slot_enabled, ref_prompt_slot_tokens = (
+        resolve_ref_speaker_prompt_slot(args, model) if use_timbre_memory else (False, 0)
+    )
+    ref_prompt_permutation = resolve_ref_prompt_codec_permutation(args, model) if use_timbre_memory else {
+        "enabled": False,
+        "min_seconds": 2.0,
+        "max_seconds": 4.0,
+        "frame_rate": 12.5,
+        "seed": 1234,
+        "mode": "shuffle",
+        "block_seconds": 0.4,
+    }
+    ref_prompt_slot_codes = None
+    if ref_prompt_slot_enabled:
+        ref_prompt_slot_codes = make_ref_speaker_prompt_slot_codes(
+            source_codes,
+            n_vq=n_vq,
+            audio_pad_code=int(model.config.audio_pad_code),
+            token_count=ref_prompt_slot_tokens,
+            slot_code=int(getattr(model.timbre_memory_config, "ref_speaker_prompt_slot_code", -1)),
+            slot_pack_mode=str(getattr(model.timbre_memory_config, "ref_speaker_prompt_slot_pack_mode", "pad")),
+        )
+    timbre_prompt_codes = timbre_codes
+    ref_prompt_permutation_stats = {
+        "enabled": 0,
+        "source_frames": int(timbre_codes.shape[0]),
+        "prompt_frames": int(timbre_codes.shape[0]),
+        "start": 0,
+        "shuffled": 0,
+    }
+    should_permute_ref_prompt = (
+        bool(ref_prompt_permutation["enabled"])
+        and ref_prompt_slot_codes is None
+        and not bool(args.timbre_side_only)
+    )
+    if should_permute_ref_prompt:
+        timbre_prompt_codes, stats = permute_ref_prompt_codes(
+            timbre_codes,
+            enabled=True,
+            min_seconds=float(ref_prompt_permutation["min_seconds"]),
+            max_seconds=float(ref_prompt_permutation["max_seconds"]),
+            frame_rate=float(ref_prompt_permutation["frame_rate"]),
+            seed=int(ref_prompt_permutation["seed"]),
+            mode=str(ref_prompt_permutation["mode"]),
+            block_seconds=float(ref_prompt_permutation["block_seconds"]),
+            bootstrap=str(ref_prompt_permutation.get("bootstrap", "off")),
+        )
+        ref_prompt_permutation_stats = stats.as_dict()
+    if ref_prompt_slot_codes is not None:
+        prompt_references = [source_codes, ref_prompt_slot_codes]
+    else:
+        prompt_references = [source_codes] if args.timbre_side_only else [source_codes, timbre_prompt_codes]
     user_message = processor.build_user_message(
         text=prompt_text,
         reference=prompt_references,
@@ -1190,12 +1429,21 @@ def main() -> int:
     print(
         "[infer] encoded codec shapes: "
         f"source={tuple(source_codes.shape)} timbre_ref={tuple(timbre_codes.shape)} "
-        f"prompt_refs={len(prompt_references)} timbre_side_only={bool(args.timbre_side_only)} n_vq={n_vq}"
+        f"prompt_refs={len(prompt_references)} timbre_side_only={bool(args.timbre_side_only)} "
+        f"ref_prompt_slot={bool(ref_prompt_slot_enabled)} n_vq={n_vq}"
+    )
+    print(
+        "[infer] ref prompt codec permutation: "
+        f"enabled={bool(ref_prompt_permutation['enabled'])} applied={bool(should_permute_ref_prompt)} "
+        f"mode={ref_prompt_permutation['mode']} block_seconds={float(ref_prompt_permutation['block_seconds']):.3f} "
+        f"seed={int(ref_prompt_permutation['seed'])} stats={ref_prompt_permutation_stats}",
+        flush=True,
     )
     print(f"[infer] prompt input_ids shape={tuple(inputs['input_ids'].shape)}")
     print(f"[infer] effective max_new_tokens={max_new_tokens} ({max_new_tokens_reason})")
     print(f"[infer] effective min_new_tokens={min_new_tokens} ({min_new_tokens_reason})")
     print(f"[infer] effective min_audio_tokens={min_audio_tokens} ({min_audio_tokens_reason})")
+    print(f"[infer] timbre cfg scale={1.0 if args.timbre_cfg_scale is None else float(args.timbre_cfg_scale):.3f}")
     print(
         "[infer] audio sampling: "
         f"temperature={gen_kwargs['audio_temperature']} "
@@ -1204,6 +1452,7 @@ def main() -> int:
         f"repetition_penalty={gen_kwargs['audio_repetition_penalty']}"
     )
     if use_timbre_memory:
+        gen_kwargs["timbre_cfg_scale"] = 1.0 if args.timbre_cfg_scale is None else float(args.timbre_cfg_scale)
         mode_id = int(getattr(model, "MODE_TO_ID", {}).get(vc_mode, 0))
         if mode_id > 0:
             gen_kwargs["vc_mode_id"] = torch.tensor([mode_id], dtype=torch.long, device=device)
@@ -1222,6 +1471,27 @@ def main() -> int:
                 inputs["input_ids"],
                 audio_pad_code=int(model.config.audio_pad_code),
             )
+            if ref_prompt_slot_enabled:
+                slot_positions = ref_speaker_prompt_slot_positions(
+                    inputs["input_ids"],
+                    audio_start_token_id=int(model.config.audio_start_token_id),
+                    audio_end_token_id=int(model.config.audio_end_token_id),
+                    audio_gen_slot_token_id=(
+                        int(getattr(model.config, "audio_user_slot_token_id", model.config.audio_assistant_gen_slot_token_id)),
+                        int(model.config.audio_assistant_gen_slot_token_id),
+                    ),
+                    token_count=int(ref_prompt_slot_tokens),
+                    occurrence=2,
+                )
+                prompt_role_ids = prompt_role_ids.clone()
+                prompt_role_ids[slot_positions.to(device=prompt_role_ids.device).bool()] = REF_CODEC
+                gen_kwargs["ref_speaker_prompt_slot_positions"] = slot_positions.to(device)
+                print(
+                    "[infer] ref speaker prompt slot "
+                    f"tokens={ref_prompt_slot_tokens} positions={int(slot_positions.sum().item())}",
+                    flush=True,
+                )
+            gen_kwargs["role_ids"] = prompt_role_ids.to(device)
             print(f"[infer] inferred prompt role counts={count_roles(prompt_role_ids).as_dict()}")
             print(
                 "[infer] Ver2 role routing enabled: "
@@ -1372,12 +1642,14 @@ def main() -> int:
                 codec_path_out.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(
                     {
-                        "generated_codec": generated_codec,
-                        "source_codec": torch.as_tensor(source_codes, dtype=torch.long).cpu(),
-                        "ref_codec": torch.as_tensor(timbre_codes, dtype=torch.long).cpu(),
-                        "n_vq": int(n_vq),
-                        "audio_segment_policy": args.audio_segment_policy,
-                    },
+                    "generated_codec": generated_codec,
+                    "source_codec": torch.as_tensor(source_codes, dtype=torch.long).cpu(),
+                    "ref_codec": torch.as_tensor(timbre_codes, dtype=torch.long).cpu(),
+                    "ref_prompt_codec": torch.as_tensor(timbre_prompt_codes, dtype=torch.long).cpu(),
+                    "ref_prompt_codec_permutation": ref_prompt_permutation_stats,
+                    "n_vq": int(n_vq),
+                    "audio_segment_policy": args.audio_segment_policy,
+                },
                     codec_path_out,
                 )
                 print(f"[infer] wrote generated codec -> {codec_path_out}")
@@ -1395,6 +1667,11 @@ def main() -> int:
                         torch.as_tensor(source_codes, dtype=torch.long).cpu().tolist(),
                         torch.as_tensor(timbre_codes, dtype=torch.long).cpu().tolist(),
                     ],
+                    "reference_prompt_audio_codes": [
+                        torch.as_tensor(source_codes, dtype=torch.long).cpu().tolist(),
+                        torch.as_tensor(timbre_prompt_codes, dtype=torch.long).cpu().tolist(),
+                    ],
+                    "ref_prompt_codec_permutation": ref_prompt_permutation_stats,
                     "audio_codes": generated_codec.cpu().tolist(),
                     "audio_codes_source": "generated",
                     "n_vq": int(n_vq),
