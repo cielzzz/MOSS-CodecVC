@@ -283,6 +283,7 @@ def _write_semantic_batch(
     checkpoint: Path,
     save_dtype: str,
     full_manifest: bool,
+    overwrite: bool,
     stats: dict[str, Any],
     out_handle: Any,
 ) -> None:
@@ -311,7 +312,7 @@ def _write_semantic_batch(
             semantic = semantic.astype(np.float32, copy=False)
         uid = safe_id(split, row, line_no)
         destination = output_root / split / f"{uid}.npy"
-        if destination.exists() and not getattr(_write_semantic_batch, "overwrite", False):
+        if destination.exists() and not overwrite:
             stats["reused"] += 1
         else:
             atomic_npy(destination, semantic)
@@ -379,7 +380,6 @@ def extract(args: argparse.Namespace) -> int:
     }
     if int(args.batch_size) <= 0:
         raise ValueError("--batch-size must be positive")
-    _write_semantic_batch.overwrite = bool(args.overwrite)
     pending: list[tuple[str, int, dict[str, Any], torch.Tensor, str]] = []
     with shard_path.open("w", encoding="utf-8") as out:
         for global_line, (split, line_no, row) in enumerate(iter_rows(specs)):
@@ -425,6 +425,7 @@ def extract(args: argparse.Namespace) -> int:
                         checkpoint=checkpoint,
                         save_dtype=args.save_dtype,
                         full_manifest=bool(args.full_manifest),
+                        overwrite=bool(args.overwrite),
                         stats=stats,
                         out_handle=out,
                     )
@@ -441,6 +442,7 @@ def extract(args: argparse.Namespace) -> int:
             checkpoint=checkpoint,
             save_dtype=args.save_dtype,
             full_manifest=bool(args.full_manifest),
+            overwrite=bool(args.overwrite),
             stats=stats,
             out_handle=out,
         )
