@@ -108,6 +108,7 @@ class TimbreMemoryConfig:
     speaker_infonce_negative_pool_size: int = 0
     speaker_infonce_negative_pool_seed: int = 1234
     speaker_condition_dropout: float = 0.0
+    ref_audio_cfg_dropout: float = 0.0
     speaker_side_pathway_enabled: bool = False
     speaker_side_pathway_layers: str | list[int] = "all"
     speaker_side_pathway_kv_bias: bool = True
@@ -189,6 +190,7 @@ class TimbreMemoryConfig:
     content_cross_attn_gate_init: float = -0.5
     content_cross_attn_dropout: float = 0.0
     content_cross_attn_output_scale: float = 0.3
+    content_encoder_hidden_size: int = 0
     content_encoder_layers: int = 2
     content_encoder_conv_kernel_size: int = 7
     guided_attn_loss_weight: float = 0.0
@@ -1164,6 +1166,13 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         if self.config is None:
             raise ValueError("Wrapped model must expose a config.")
         hidden_size = int(self.config.language_config.hidden_size)
+        configured_content_hidden_size = int(config.content_encoder_hidden_size)
+        if configured_content_hidden_size < 0:
+            raise ValueError("content_encoder_hidden_size must be non-negative")
+        self.content_memory_hidden_size = configured_content_hidden_size or hidden_size
+        ref_audio_cfg_dropout = float(config.ref_audio_cfg_dropout)
+        if not 0.0 <= ref_audio_cfg_dropout <= 1.0:
+            raise ValueError("ref_audio_cfg_dropout must be in [0, 1]")
         layers = getattr(base_model.language_model, "layers", None)
         if layers is None:
             raise ValueError("Wrapped MossTTSDelayModel must expose language_model.layers.")
@@ -1367,8 +1376,11 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             )
         self.content_ctc_head: ContentCTCHead | None = None
         if config.content_ctc_weight > 0 and config.content_ctc_vocab_size > 1:
+            content_ctc_hidden_size = (
+                self.content_memory_hidden_size if bool(config.content_cross_attn_enabled) else hidden_size
+            )
             self.content_ctc_head = ContentCTCHead(
-                hidden_size=hidden_size,
+                hidden_size=content_ctc_hidden_size,
                 vocab_size=config.content_ctc_vocab_size,
                 adapter_dim=config.adapter_dim,
                 dropout=config.dropout,
@@ -1498,7 +1510,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         if bool(config.content_cross_attn_enabled):
             self.content_cross_attn_encoder = ContentConformerEncoder(
                 input_dim=int(config.content_cross_attn_feature_dim),
-                hidden_size=hidden_size,
+                hidden_size=self.content_memory_hidden_size,
                 num_layers=int(config.content_encoder_layers),
                 num_heads=int(config.num_heads),
                 dropout=float(config.content_cross_attn_dropout),
@@ -1512,6 +1524,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 {
                     str(idx): ContentCrossAttentionLayer(
                         hidden_size=hidden_size,
+                        memory_size=self.content_memory_hidden_size,
                         num_heads=int(config.num_heads),
                         adapter_dim=int(config.adapter_dim),
                         dropout=float(config.content_cross_attn_dropout),
@@ -1527,7 +1540,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                         "phoneme_classifier_loss_weight > 0 requires content_token_vocab_size > 1"
                     )
                 self.content_phoneme_classifier = ContentPhonemeClassifierHead(
-                    hidden_size=hidden_size,
+                    hidden_size=self.content_memory_hidden_size,
                     vocab_size=int(config.content_token_vocab_size),
                     adapter_dim=int(config.adapter_dim),
                     dropout=float(config.content_cross_attn_dropout),
@@ -1609,6 +1622,8 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         self.last_speaker_aux_stats: dict[str, float] = {}
         self.last_ref_speaker_prompt_slot_stats: dict[str, float] = {}
         self.last_ref_speaker_prompt_attention_stats: dict[str, Any] = {}
+        self.last_ref_audio_cfg_stats: dict[str, float] = {}
+        self.last_ref_audio_cfg_infer_stats: dict[str, float] = {}
         self.last_target_front_ce_stats: dict[str, float] = {}
         self.last_prosody_aux_loss: float | None = None
         self.last_prosody_aux_stats: dict[str, float] = {}
@@ -2480,7 +2495,39 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         state = self.content_cross_attn_encoder(features, mask)
         self.last_content_cross_attn_memory_shape = tuple(state.memory.shape)
         self.last_content_cross_attn_aux_stats.update(state.stats)
+        self.last_content_cross_attn_aux_stats["content_cross_attn_memory_dim"] = float(
+            state.memory.shape[-1]
+        )
         return state.memory, state.mask
+
+    def _content_cross_attn_active_sample_mask(
+        self,
+        vc_mode_id: torch.Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if vc_mode_id is None:
+            return None
+        mode = vc_mode_id.to(device=device).long().view(-1)
+        if mode.numel() == 1 and int(batch_size) > 1:
+            mode = mode.expand(int(batch_size))
+        if mode.numel() != int(batch_size):
+            self.last_content_cross_attn_aux_stats["content_cross_attn_mode_mask_invalid"] = 1.0
+            return None
+        no_text_id = int(self.MODE_TO_ID.get(VC_MODE_NO_TEXT, 2))
+        return mode.eq(no_text_id)
+
+    def _record_content_cross_attn_bypass_stats(self, active_sample_mask: torch.Tensor | None) -> None:
+        if active_sample_mask is None:
+            return
+        active = active_sample_mask.detach().bool().float()
+        stats = {
+            "content_cross_attn_mode_bypass_enabled": 1.0,
+            "content_cross_attn_active_samples": float(active.sum().item()),
+            "content_cross_attn_text_bypass_samples": float((1.0 - active).sum().item()),
+        }
+        self.last_content_cross_attn_aux_stats.update(stats)
 
     def _refresh_content_cross_attn_stats(self) -> None:
         stats_rows = self._active_content_cross_attn_stats
@@ -2514,6 +2561,14 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             or str(layer_idx) not in self.content_cross_attn_layers
         ):
             return None
+        active_sample_mask = self._content_cross_attn_active_sample_mask(
+            self._active_vc_mode_id,
+            batch_size=int(hidden_states.shape[0]),
+            device=hidden_states.device,
+        )
+        if active_sample_mask is not None:
+            self._record_content_cross_attn_bypass_stats(active_sample_mask)
+            target_mask = target_mask.to(device=hidden_states.device).bool() & active_sample_mask.view(-1, 1)
         layer = self.content_cross_attn_layers[str(layer_idx)]
         out = layer(
             hidden_states,
@@ -2526,6 +2581,11 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         if out.attention_weights is not None:
             self._active_content_cross_attn_attentions.append(out.attention_weights)
         layer_stats = dict(out.stats)
+        if active_sample_mask is not None:
+            active = active_sample_mask.detach().bool().float()
+            layer_stats["content_cross_attn_mode_bypass_enabled"] = 1.0
+            layer_stats["content_cross_attn_active_samples"] = float(active.sum().item())
+            layer_stats["content_cross_attn_text_bypass_samples"] = float((1.0 - active).sum().item())
         for key, value in out.stats.items():
             short_key = key.replace("content_cross_attn_", "")
             layer_stats[f"content_cross_attn_layer_{layer_idx}_{short_key}"] = float(value)
@@ -2550,6 +2610,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         content_token_ids_mask: torch.Tensor | None = None,
         source_content_ids: torch.Tensor | None = None,
         source_content_ids_mask: torch.Tensor | None = None,
+        vc_mode_id: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         self.last_content_cross_attn_aux_loss = None
         stats = dict(self.last_content_cross_attn_aux_stats)
@@ -2559,6 +2620,17 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             self.last_content_cross_attn_aux_stats = stats
             return None
         terms: list[torch.Tensor] = []
+        active_sample_mask = self._content_cross_attn_active_sample_mask(
+            vc_mode_id,
+            batch_size=int(target_position_mask.shape[0]),
+            device=target_position_mask.device,
+        )
+        if active_sample_mask is not None:
+            active = active_sample_mask.detach().bool().float()
+            stats["content_cross_attn_mode_bypass_enabled"] = 1.0
+            stats["content_cross_attn_active_samples"] = float(active.sum().item())
+            stats["content_cross_attn_text_bypass_samples"] = float((1.0 - active).sum().item())
+            target_position_mask = target_position_mask.to(device=target_position_mask.device).bool() & active_sample_mask.view(-1, 1)
         guided_weight = float(self.timbre_memory_config.guided_attn_loss_weight)
         warmup_steps = int(self.timbre_memory_config.guided_attn_warmup_steps)
         if guided_weight > 0.0:
@@ -2582,6 +2654,12 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         if phoneme_weight > 0.0 and self.content_phoneme_classifier is not None and content_cross_attn_memory is not None:
             token_ids = content_token_ids if content_token_ids is not None else source_content_ids
             token_mask = content_token_ids_mask if content_token_ids is not None else source_content_ids_mask
+            if active_sample_mask is not None and token_ids is not None:
+                active_for_tokens = active_sample_mask.to(device=token_ids.device).bool().view(-1, 1)
+                if token_mask is None:
+                    token_mask = token_ids.ge(0) & active_for_tokens
+                else:
+                    token_mask = token_mask.to(device=token_ids.device).bool() & active_for_tokens
             logits = self.content_phoneme_classifier(
                 content_cross_attn_memory.to(device=next(self.content_phoneme_classifier.parameters()).device)
             )
@@ -3373,6 +3451,85 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
 
         return hook
 
+    def _prompt_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        role_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        base_model = self.get_base_model()
+        if self.role_router is not None:
+            return self.role_router.compute_input_embeddings(base_model, input_ids, role_ids)
+        compute_input_embeddings = getattr(base_model, "_compute_input_embeddings", None)
+        if callable(compute_input_embeddings):
+            return compute_input_embeddings(input_ids)
+        inputs_embeds = base_model.get_input_embeddings()(input_ids[..., 0])
+        for idx, embed_layer in enumerate(base_model.emb_ext):
+            inputs_embeds = inputs_embeds + embed_layer(input_ids[..., idx + 1])
+        return inputs_embeds
+
+    def _apply_ref_audio_condition_dropout(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        input_ids: torch.Tensor | None,
+        ref_positions: torch.Tensor | None,
+        role_ids: torch.Tensor | None,
+        vc_mode_id: torch.Tensor | None,
+        force_drop: bool = False,
+    ) -> None:
+        drop_prob = float(self.timbre_memory_config.ref_audio_cfg_dropout)
+        stats: dict[str, float] = {
+            "ref_audio_cfg_dropout_prob": drop_prob,
+            "ref_audio_cfg_force_drop": 1.0 if force_drop else 0.0,
+            "ref_audio_cfg_null_audio_zero": 1.0,
+        }
+        self.last_ref_audio_cfg_stats = stats
+        if input_ids is None or ref_positions is None:
+            if force_drop or (self.training and drop_prob > 0.0):
+                stats["ref_audio_cfg_prompt_mask_missing"] = 1.0
+            return
+        aligned_positions = self._align_time_mask(ref_positions, input_ids.shape[:2])
+        if aligned_positions is None:
+            stats["ref_audio_cfg_prompt_mask_invalid"] = 1.0
+            return
+        aligned_positions = aligned_positions.to(device=input_ids.device).bool()
+        active_rows = aligned_positions.any(dim=1)
+        stats["ref_audio_cfg_active_rows"] = float(active_rows.float().sum().item())
+        stats["ref_audio_cfg_active_positions"] = float(aligned_positions.float().sum().item())
+        if force_drop:
+            drop_rows = active_rows
+        elif self.training and drop_prob > 0.0:
+            drop_rows = (torch.rand(active_rows.shape, device=input_ids.device) < drop_prob) & active_rows
+        else:
+            drop_rows = torch.zeros_like(active_rows)
+        drop_positions = aligned_positions & drop_rows.view(-1, 1)
+        stats["ref_audio_cfg_dropped_rows"] = float(drop_rows.float().sum().item())
+        stats["ref_audio_cfg_kept_rows"] = float((active_rows & ~drop_rows).float().sum().item())
+        stats["ref_audio_cfg_dropped_positions"] = float(drop_positions.float().sum().item())
+        if vc_mode_id is not None and int(vc_mode_id.numel()) in {1, int(input_ids.shape[0])}:
+            mode = vc_mode_id.to(device=input_ids.device).long().view(-1)
+            if mode.numel() == 1 and int(input_ids.shape[0]) > 1:
+                mode = mode.expand(int(input_ids.shape[0]))
+            stats["ref_audio_cfg_dropped_text_rows"] = float(
+                (drop_rows & mode.eq(int(self.MODE_TO_ID[VC_MODE_TEXT]))).float().sum().item()
+            )
+            stats["ref_audio_cfg_dropped_no_text_rows"] = float(
+                (drop_rows & mode.eq(int(self.MODE_TO_ID[VC_MODE_NO_TEXT]))).float().sum().item()
+            )
+        if not bool(drop_positions.any().item()):
+            return
+        inputs_embeds = kwargs.get("inputs_embeds")
+        if inputs_embeds is None:
+            inputs_embeds = self._prompt_input_embeddings(input_ids, role_ids)
+        text_embeds = self.get_base_model().get_input_embeddings()(input_ids[..., 0])
+        text_embeds = text_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        drop_positions = drop_positions.to(device=inputs_embeds.device)
+        kwargs["inputs_embeds"] = torch.where(
+            drop_positions.unsqueeze(-1),
+            text_embeds,
+            inputs_embeds,
+        )
+
     def _forward_with_timbre_tokens(
         self,
         *args,
@@ -3393,6 +3550,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         role_ids: torch.Tensor | None = None,
         timbre_ref_prompt_positions: torch.Tensor | None = None,
         ref_speaker_prompt_slot_positions: torch.Tensor | None = None,
+        force_drop_ref_audio_condition: bool = False,
         labels: torch.Tensor | None = None,
         **kwargs,
     ):
@@ -3423,6 +3581,14 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 role_ids=role_ids,
                 ref_speaker_prompt_source_tokens=timbre_tokens,
             )
+        self._apply_ref_audio_condition_dropout(
+            kwargs,
+            input_ids=input_ids,
+            ref_positions=timbre_ref_prompt_positions,
+            role_ids=role_ids,
+            vc_mode_id=vc_mode_id,
+            force_drop=bool(force_drop_ref_audio_condition),
+        )
         base_labels = None if self.target_head_router is not None else labels
         if self.target_head_router is None:
             kwargs["channelwise_loss_weight"] = channelwise_loss_weight
@@ -3499,6 +3665,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 content_token_ids_mask=content_token_ids_mask,
                 source_content_ids=source_content_ids,
                 source_content_ids_mask=source_content_ids_mask,
+                vc_mode_id=vc_mode_id,
             )
             if content_cross_attn_loss is not None:
                 if getattr(outputs, "loss", None) is None:
@@ -3876,29 +4043,103 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         outputs,
         target_position_mask: torch.Tensor | None,
         *,
+        content_cross_attn_memory: torch.Tensor | None = None,
+        content_cross_attn_mask: torch.Tensor | None = None,
         content_token_ids: torch.Tensor | None = None,
         content_token_ids_mask: torch.Tensor | None = None,
+        vc_mode_id: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         self.last_content_ctc_aux_loss = None
         self.last_content_ctc_aux_stats = {}
         if self.content_ctc_head is None or self.timbre_memory_config.content_ctc_weight <= 0:
             return None
-        selected = self._target_hidden_for_aux(outputs, target_position_mask)
-        if selected is None:
-            return None
-        target_hidden, target_hidden_mask = selected
-        logits = self.content_ctc_head(target_hidden)
+
+        stats: dict[str, float] = {}
+        ctc_hidden: torch.Tensor | None
+        ctc_input_mask: torch.Tensor | None
+        ctc_token_ids = content_token_ids
+        ctc_token_mask = content_token_ids_mask
+        if self.content_cross_attn_encoder is not None:
+            batch_size = None
+            device = None
+            if content_cross_attn_memory is not None:
+                batch_size = int(content_cross_attn_memory.shape[0])
+                device = content_cross_attn_memory.device
+            elif target_position_mask is not None:
+                batch_size = int(target_position_mask.shape[0])
+                device = target_position_mask.device
+            elif vc_mode_id is not None:
+                batch_size = int(vc_mode_id.numel())
+                device = vc_mode_id.device
+
+            active_sample_mask = None
+            if batch_size is not None and device is not None:
+                active_sample_mask = self._content_cross_attn_active_sample_mask(
+                    vc_mode_id,
+                    batch_size=batch_size,
+                    device=device,
+                )
+            if active_sample_mask is not None:
+                active = active_sample_mask.detach().bool()
+                stats.update(
+                    {
+                        "content_ctc_mode_bypass_enabled": 1.0,
+                        "content_ctc_active_samples": float(active.float().sum().item()),
+                        "content_ctc_text_bypass_samples": float((~active).float().sum().item()),
+                    }
+                )
+                if not bool(active.any().item()):
+                    self.last_content_ctc_aux_stats = stats
+                    return None
+            if content_cross_attn_memory is None:
+                stats["content_ctc_memory_missing"] = 1.0
+                self.last_content_ctc_aux_stats = stats
+                return None
+
+            ctc_hidden = content_cross_attn_memory
+            if content_cross_attn_mask is None:
+                ctc_input_mask = torch.ones(
+                    ctc_hidden.shape[:2],
+                    dtype=torch.bool,
+                    device=ctc_hidden.device,
+                )
+            else:
+                ctc_input_mask = content_cross_attn_mask.to(device=ctc_hidden.device).bool()
+            if active_sample_mask is not None:
+                active_indices = torch.nonzero(active_sample_mask, as_tuple=False).flatten()
+                ctc_hidden = ctc_hidden.index_select(0, active_indices.to(device=ctc_hidden.device))
+                ctc_input_mask = ctc_input_mask.index_select(0, active_indices.to(device=ctc_input_mask.device))
+                if ctc_token_ids is not None:
+                    ctc_token_ids = ctc_token_ids.index_select(
+                        0,
+                        active_indices.to(device=ctc_token_ids.device),
+                    )
+                if ctc_token_mask is not None:
+                    ctc_token_mask = ctc_token_mask.index_select(
+                        0,
+                        active_indices.to(device=ctc_token_mask.device),
+                    )
+            stats["content_ctc_input_source_bnf_memory"] = 1.0
+        else:
+            selected = self._target_hidden_for_aux(outputs, target_position_mask)
+            if selected is None:
+                return None
+            ctc_hidden, ctc_input_mask = selected
+            stats["content_ctc_input_source_bnf_memory"] = 0.0
+
+        logits = self.content_ctc_head(ctc_hidden)
         state = compute_content_ctc_loss(
             logits,
-            target_hidden_mask,
-            content_token_ids,
-            content_token_ids_mask,
+            ctc_input_mask,
+            ctc_token_ids,
+            ctc_token_mask,
             blank_id=int(self.timbre_memory_config.content_ctc_blank_id),
         )
+        stats.update(state.stats)
         if state.loss is None:
+            self.last_content_ctc_aux_stats = stats
             return None
         weighted = state.loss * float(self.timbre_memory_config.content_ctc_weight)
-        stats = dict(state.stats)
         stats["content_ctc_loss_weighted"] = float(weighted.detach().item())
         self.last_content_ctc_aux_loss = float(weighted.detach().item())
         self.last_content_ctc_aux_stats = stats
@@ -4409,6 +4650,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         self.last_content_cross_attn_aux_loss = None
         self.last_content_cross_attn_aux_stats = {}
         self.last_content_cross_attn_memory_shape = None
+        self.last_ref_audio_cfg_stats = {}
         self.last_ref_content_suppression_loss = None
         self.last_ref_content_suppression_stats = {}
         if target_position_mask is None and labels is not None:
@@ -4589,8 +4831,11 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         content_ctc_loss = self._content_ctc_aux_loss(
             outputs,
             target_position_mask=target_position_mask,
+            content_cross_attn_memory=content_cross_attn_memory,
+            content_cross_attn_mask=content_cross_attn_mask,
             content_token_ids=content_token_ids,
             content_token_ids_mask=content_token_ids_mask,
+            vc_mode_id=vc_mode_id,
         )
         if content_ctc_loss is not None and getattr(outputs, "loss", None) is not None:
             outputs.loss = outputs.loss + content_ctc_loss
@@ -4842,6 +5087,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         speaker_seq_features: torch.Tensor | None = None,
         speaker_seq_features_mask: torch.Tensor | None = None,
         timbre_cfg_scale: float = 1.0,
+        ref_audio_cfg_scale: float = 1.0,
         role_ids: torch.Tensor | None = None,
         ref_speaker_prompt_slot_positions: torch.Tensor | None = None,
         ref_speaker_prompt_attention_capture_frames: int = 0,
@@ -4859,6 +5105,8 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         self.last_ref_speaker_prompt_attention_stats = {}
         self.last_ref_speaker_prompt_slot_stats = {}
         self.last_progress_stop_infer_stats = {}
+        self.last_ref_audio_cfg_stats = {}
+        self.last_ref_audio_cfg_infer_stats = {}
         side_pathway_enabled = bool(self.timbre_memory_config.speaker_side_pathway_enabled) or bool(
             self.timbre_memory_config.speaker_cross_attn_enabled
         )
@@ -4894,6 +5142,25 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 adapter.monotonic_release_after_progress = bool(source_semantic_release_after_progress)
                 adapter.monotonic_release_start = release_start
         cfg_scale = float(timbre_cfg_scale)
+        ref_cfg_scale = float(ref_audio_cfg_scale)
+        if ref_cfg_scale <= 0.0:
+            raise ValueError("ref_audio_cfg_scale must be positive")
+        ref_cfg_active = abs(ref_cfg_scale - 1.0) > 1.0e-6
+        legacy_cfg_requested = abs(cfg_scale - 1.0) > 1.0e-6 and (
+            side_pathway_enabled or self.legacy_timbre_memory_enabled
+        )
+        if ref_cfg_active and legacy_cfg_requested:
+            raise ValueError("ref-audio CFG and legacy speaker/timbre CFG cannot be enabled together")
+        if ref_cfg_active and (
+            self.legacy_timbre_memory_enabled
+            or side_pathway_enabled
+            or int(self.timbre_memory_config.ref_speaker_prompt_tokens) > 0
+            or self.ref_speaker_adaln is not None
+        ):
+            raise ValueError(
+                "true ref-audio CFG requires legacy timbre memory, speaker side pathways, "
+                "ref speaker prompt tokens, and ref speaker AdaLN to be disabled"
+            )
         cfg_timbre_tokens = None
         if abs(cfg_scale - 1.0) > 1.0e-6 and not side_pathway_enabled and self.legacy_timbre_memory_enabled:
             cfg_timbre_tokens = self._compute_timbre_tokens(
@@ -4914,7 +5181,14 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             )
         else:
             timbre_tokens = None
+        legacy_cfg_active = cfg_timbre_tokens is not None or (
+            side_pathway_enabled and abs(cfg_scale - 1.0) > 1.0e-6
+        )
+        cfg_branch_active = ref_cfg_active or legacy_cfg_active
+        guidance_scale = ref_cfg_scale if ref_cfg_active else cfg_scale
+        cfg_branch_timbre_tokens = timbre_tokens if ref_cfg_active else cfg_timbre_tokens
         prompt_role_ids = None
+        prompt_ref_positions = None
         prompt_source_positions = None
         prosody_tokens = None
         prosody_batch_gate = None
@@ -4964,6 +5238,21 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     device=prosody_tokens.device,
                     dtype=prosody_tokens.dtype,
                 )
+        if ref_cfg_active:
+            if prompt_role_ids is not None:
+                ref_role_ids = prompt_role_ids
+            elif role_ids is not None:
+                ref_role_ids = role_ids.to(device=input_ids.device, dtype=torch.long)
+                if ref_role_ids.shape != input_ids.shape[:2]:
+                    ref_role_ids = self._align_time_values(ref_role_ids, input_ids.shape[:2]).long()
+            else:
+                ref_role_ids = infer_prompt_role_ids_from_audio_spans(
+                    input_ids,
+                    audio_pad_code=int(config.audio_pad_code),
+                )
+            prompt_ref_positions = ref_role_ids.eq(REF_CODEC)
+            if not bool(prompt_ref_positions.any().item()):
+                raise ValueError("ref-audio CFG could not locate the C_ref prompt span")
         source_semantic_memory = None
         source_semantic_memory_mask = None
         if self.source_semantic_memory_encoder is not None:
@@ -5055,6 +5344,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         progress_stop_prob_max = torch.zeros(batch_size, dtype=torch.float32, device=device)
         progress_stop_value_max = torch.zeros(batch_size, dtype=torch.float32, device=device)
         progress_stop_steps = 0
+        cfg_forward_steps = 0
 
         for time_step in tqdm(range(max_new_tokens), desc=f"Generating bs{batch_size} ..."):
             target_mask = torch.zeros(current_input_ids.shape[:2], dtype=torch.bool, device=device)
@@ -5077,6 +5367,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             attention_kwargs = {"output_attentions": True} if capture_ref_slot_attention else {}
             if progress_stop_infer_enabled:
                 attention_kwargs["output_hidden_states"] = True
+            cond_ref_positions = prompt_ref_positions if past_key_values is None else None
             try:
                 if side_pathway_enabled:
                     self._prepare_speaker_side_condition(
@@ -5109,7 +5400,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     content_token_ids_mask=content_token_ids_mask,
                     vc_mode_id=vc_mode_id,
                     role_ids=current_role_ids,
-                    timbre_ref_prompt_positions=None,
+                    timbre_ref_prompt_positions=cond_ref_positions,
                     ref_speaker_prompt_slot_positions=ref_speaker_prompt_slot_positions,
                     **attention_kwargs,
                 )
@@ -5154,7 +5445,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     content_token_ids_mask=content_token_ids_mask,
                     vc_mode_id=vc_mode_id,
                     role_ids=current_role_ids,
-                    timbre_ref_prompt_positions=None,
+                    timbre_ref_prompt_positions=cond_ref_positions,
                     ref_speaker_prompt_slot_positions=ref_speaker_prompt_slot_positions,
                 )
             if capture_ref_slot_attention:
@@ -5168,7 +5459,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                 if attention_row is not None:
                     ref_slot_attention_rows.append(attention_row)
             cfg_outputs = None
-            if cfg_timbre_tokens is not None or (side_pathway_enabled and abs(cfg_scale - 1.0) > 1.0e-6):
+            if cfg_branch_active:
                 if side_pathway_enabled:
                     self._prepare_speaker_side_condition(
                         batch_size=batch_size,
@@ -5188,7 +5479,7 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     attention_mask=current_attention_mask,
                     past_key_values=cfg_past_key_values,
                     use_cache=True,
-                    timbre_tokens=cfg_timbre_tokens,
+                    timbre_tokens=cfg_branch_timbre_tokens,
                     target_position_mask=target_mask,
                     target_position_progress=target_progress,
                     prosody_tokens=prosody_tokens,
@@ -5201,16 +5492,20 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
                     content_token_ids_mask=content_token_ids_mask,
                     vc_mode_id=vc_mode_id,
                     role_ids=current_role_ids,
-                    timbre_ref_prompt_positions=None,
+                    timbre_ref_prompt_positions=(
+                        prompt_ref_positions if ref_cfg_active and cfg_past_key_values is None else None
+                    ),
                     ref_speaker_prompt_slot_positions=ref_speaker_prompt_slot_positions,
+                    force_drop_ref_audio_condition=bool(ref_cfg_active and cfg_past_key_values is None),
                 )
                 cfg_past_key_values = cfg_outputs.past_key_values
+                cfg_forward_steps += 1
             past_key_values = outputs.past_key_values
 
             raw_logits = outputs.logits
             if cfg_outputs is not None:
                 raw_logits = [
-                    uncond_logit + cfg_scale * (cond_logit - uncond_logit)
+                    uncond_logit + guidance_scale * (cond_logit - uncond_logit)
                     for cond_logit, uncond_logit in zip(outputs.logits, cfg_outputs.logits)
                 ]
             next_token_logits = [
@@ -5336,6 +5631,14 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
             if is_stopping.sum() == batch_size:
                 break
 
+        self.last_ref_audio_cfg_infer_stats = {
+            "ref_audio_cfg_scale": float(ref_cfg_scale),
+            "ref_audio_cfg_active": 1.0 if ref_cfg_active else 0.0,
+            "ref_audio_cfg_uncond_forward_steps": float(cfg_forward_steps if ref_cfg_active else 0),
+            "ref_audio_cfg_prompt_positions": float(
+                0 if prompt_ref_positions is None else prompt_ref_positions.detach().float().sum().item()
+            ),
+        }
         if progress_stop_infer_enabled:
             forced_rows = progress_stop_forced.detach().cpu()
             self.last_progress_stop_infer_stats = {

@@ -128,6 +128,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lora-r", type=int, default=8)
     ap.add_argument("--lora-alpha", type=int, default=16)
     ap.add_argument("--lora-dropout", type=float, default=0.05)
+    ap.add_argument(
+        "--lora-warmup-freeze-steps",
+        type=int,
+        default=0,
+        help="Keep all LoRA parameters unchanged for the first N optimizer updates by clearing their gradients.",
+    )
     ap.add_argument("--resume-adapter-path", default="")
     ap.add_argument("--trainable-lora-modules", choices=("all", "mlp", "mlp_plus_o"), default="all")
     ap.add_argument("--lm-heads-mode", choices=("none", "audio", "all"), default="none")
@@ -204,6 +210,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--speaker-infonce-negative-pool-size", type=int, default=None)
     ap.add_argument("--speaker-infonce-negative-pool-seed", type=int, default=None)
     ap.add_argument("--speaker-condition-dropout", type=float, default=None)
+    ap.add_argument(
+        "--ref-audio-cfg-dropout",
+        type=float,
+        default=None,
+        help="Training-time row dropout probability for reference-audio conditioning. 0 disables CFG dropout.",
+    )
     ap.add_argument("--enable-speaker-side-pathway", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--speaker-side-pathway-layers", default=None)
     ap.add_argument("--speaker-side-pathway-kv-bias", action=argparse.BooleanOptionalAction, default=None)
@@ -233,6 +245,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="LR multiplier for the auxiliary content_ctc_head parameters. 1.0 keeps them in the base optimizer group.",
+    )
+    ap.add_argument(
+        "--content-cross-attn-lr-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "LR multiplier for non-gate content cross-attention pathway parameters "
+            "(content encoder, attention layers, and phoneme classifier)."
+        ),
     )
     ap.add_argument(
         "--timbre-adapter-gate-lr-multiplier",
@@ -388,6 +409,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--content-cross-attn-gate-init", type=float, default=None)
     ap.add_argument("--content-cross-attn-dropout", type=float, default=None)
     ap.add_argument("--content-cross-attn-output-scale", type=float, default=None)
+    ap.add_argument(
+        "--content-encoder-hidden-size",
+        type=int,
+        default=None,
+        help="Content encoder internal hidden size. 0 reuses the backbone hidden size.",
+    )
     ap.add_argument("--content-encoder-layers", type=int, default=None)
     ap.add_argument("--content-encoder-conv-kernel-size", type=int, default=None)
     ap.add_argument("--guided-attn-loss-weight", type=float, default=None)
@@ -1469,6 +1496,18 @@ def source_semantic_trainable_parameters(model: torch.nn.Module) -> dict[str, to
     }
 
 
+def content_cross_attn_trainable_parameters(model: torch.nn.Module) -> dict[str, torch.nn.Parameter]:
+    return {
+        name: param
+        for name, param in model.named_parameters()
+        if (
+            param.requires_grad
+            and is_content_cross_attn_trainable_param_name(name)
+            and not is_content_cross_attn_gate_param_name(name)
+        )
+    }
+
+
 def collect_lora_fsdp_ignored_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
     """Keep trainable LoRA A/B modules replicated so rank0 can save them without FSDP gather."""
     ignored: list[torch.nn.Module] = []
@@ -1549,6 +1588,7 @@ def build_optimizer_param_groups(
     source_semantic_lr_multiplier: float = 1.0,
     source_semantic_gate_lr_multiplier: float = 10.0,
     content_ctc_head_lr_multiplier: float = 1.0,
+    content_cross_attn_lr_multiplier: float = 1.0,
     timbre_adapter_gate_lr_multiplier: float = 1.0,
     ref_speaker_prompt_lr_multiplier: float = 1.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1558,6 +1598,13 @@ def build_optimizer_param_groups(
     source_semantic_gate_param_ids = {id(param) for param in source_semantic_gate_named_params.values()}
     timbre_adapter_gate_named_params = timbre_adapter_gate_parameters(model)
     timbre_adapter_gate_param_ids = {id(param) for param in timbre_adapter_gate_named_params.values()}
+    content_cross_attn_named_params = content_cross_attn_trainable_parameters(model)
+    content_cross_attn_named_params = {
+        name: param
+        for name, param in content_cross_attn_named_params.items()
+        if id(param) not in timbre_adapter_gate_param_ids
+    }
+    content_cross_attn_param_ids = {id(param) for param in content_cross_attn_named_params.values()}
     source_semantic_named_params = source_semantic_trainable_parameters(model)
     source_semantic_named_params = {
         name: param
@@ -1592,6 +1639,7 @@ def build_optimizer_param_groups(
             and id(param) not in gate_param_ids
             and id(param) not in source_semantic_gate_param_ids
             and id(param) not in timbre_adapter_gate_param_ids
+            and id(param) not in content_cross_attn_param_ids
             and id(param) not in source_semantic_param_ids
             and id(param) not in ctc_head_param_ids
             and id(param) not in ref_speaker_prompt_param_ids
@@ -1621,6 +1669,12 @@ def build_optimizer_param_groups(
         "content_ctc_head_tensors": len(ctc_head_named_params),
         "content_ctc_head_params": sum(param.numel() for param in ctc_head_named_params.values()),
         "content_ctc_head_lr_multiplier": float(content_ctc_head_lr_multiplier) if ctc_head_named_params else 1.0,
+        "content_cross_attn_tensors": len(content_cross_attn_named_params),
+        "content_cross_attn_params": sum(param.numel() for param in content_cross_attn_named_params.values()),
+        "content_cross_attn_lr_multiplier": (
+            float(content_cross_attn_lr_multiplier) if content_cross_attn_named_params else 1.0
+        ),
+        "content_cross_attn_group_index": -1,
         "ref_speaker_prompt_tensors": len(ref_speaker_prompt_named_params),
         "ref_speaker_prompt_params": sum(param.numel() for param in ref_speaker_prompt_named_params.values()),
         "ref_speaker_prompt_lr_multiplier": (
@@ -1660,6 +1714,15 @@ def build_optimizer_param_groups(
                 "weight_decay": 0.0,
             }
         )
+    if content_cross_attn_named_params:
+        summary["content_cross_attn_group_index"] = len(param_groups)
+        param_groups.append(
+            {
+                "params": list(content_cross_attn_named_params.values()),
+                "lr": float(learning_rate) * float(content_cross_attn_lr_multiplier),
+                "weight_decay": float(weight_decay),
+            }
+        )
     if use_source_semantic_group:
         param_groups.append(
             {
@@ -1684,6 +1747,20 @@ def build_optimizer_param_groups(
                 "weight_decay": float(weight_decay),
             }
         )
+    seen_param_groups: dict[int, int] = {}
+    duplicate_param_ids: set[int] = set()
+    for group_index, group in enumerate(param_groups):
+        for param in group["params"]:
+            param_id = id(param)
+            if param_id in seen_param_groups:
+                duplicate_param_ids.add(param_id)
+            else:
+                seen_param_groups[param_id] = group_index
+    if duplicate_param_ids:
+        duplicate_names = [
+            name for name, param in model.named_parameters() if id(param) in duplicate_param_ids
+        ]
+        raise RuntimeError(f"optimizer parameter groups contain duplicate parameters: {duplicate_names}")
     return param_groups, summary
 
 
@@ -1850,6 +1927,13 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         if args.speaker_condition_dropout is not None
         else float(deep_get(cfg, "model.speaker_condition_dropout", 0.0))
     )
+    ref_audio_cfg_dropout = (
+        float(args.ref_audio_cfg_dropout)
+        if args.ref_audio_cfg_dropout is not None
+        else float(deep_get(cfg, "model.ref_audio_cfg_dropout", 0.0))
+    )
+    if not 0.0 <= ref_audio_cfg_dropout <= 1.0:
+        raise ValueError(f"ref_audio_cfg_dropout must be in [0, 1], got {ref_audio_cfg_dropout}")
     speaker_side_pathway_enabled = (
         bool(args.enable_speaker_side_pathway)
         if args.enable_speaker_side_pathway is not None
@@ -2225,6 +2309,15 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         if args.content_cross_attn_output_scale is not None
         else float(deep_get(cfg, "content_cross_attn.output_scale", 0.3))
     )
+    content_encoder_hidden_size = (
+        int(args.content_encoder_hidden_size)
+        if args.content_encoder_hidden_size is not None
+        else int(deep_get(cfg, "content_cross_attn.encoder_hidden_size", 0))
+    )
+    if content_encoder_hidden_size < 0:
+        raise ValueError(
+            f"content_encoder_hidden_size must be non-negative, got {content_encoder_hidden_size}"
+        )
     content_encoder_layers = (
         int(args.content_encoder_layers)
         if args.content_encoder_layers is not None
@@ -2351,6 +2444,7 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         speaker_infonce_negative_pool_size=speaker_infonce_negative_pool_size,
         speaker_infonce_negative_pool_seed=speaker_infonce_negative_pool_seed,
         speaker_condition_dropout=speaker_condition_dropout,
+        ref_audio_cfg_dropout=ref_audio_cfg_dropout,
         speaker_side_pathway_enabled=speaker_side_pathway_enabled,
         speaker_side_pathway_layers=speaker_side_pathway_layers,
         speaker_side_pathway_kv_bias=speaker_side_pathway_kv_bias,
@@ -2431,6 +2525,7 @@ def resolve_timbre_memory_config(cfg: dict[str, Any], args: argparse.Namespace) 
         content_cross_attn_gate_init=content_cross_attn_gate_init,
         content_cross_attn_dropout=content_cross_attn_dropout,
         content_cross_attn_output_scale=content_cross_attn_output_scale,
+        content_encoder_hidden_size=content_encoder_hidden_size,
         content_encoder_layers=content_encoder_layers,
         content_encoder_conv_kernel_size=content_encoder_conv_kernel_size,
         guided_attn_loss_weight=guided_attn_loss_weight,
@@ -2479,6 +2574,17 @@ def lora_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
         total_norm_sq += norm * norm
         has_nonzero = has_nonzero or torch.count_nonzero(grad).item() > 0
     return math.sqrt(total_norm_sq), has_nonzero
+
+
+def clear_lora_grads(model: torch.nn.Module) -> int:
+    """Make AdamW skip LoRA parameters, including decoupled weight decay, for this update."""
+    cleared = 0
+    for name, param in model.named_parameters():
+        if "lora_" not in name or param.grad is None:
+            continue
+        param.grad = None
+        cleared += 1
+    return cleared
 
 
 def timbre_adapter_grad_stats(model: torch.nn.Module) -> tuple[float, bool]:
@@ -3088,6 +3194,7 @@ def collect_aux_loss_scalars(model: torch.nn.Module) -> dict[str, float | None]:
         "last_semantic_aux_stats",
         "last_source_semantic_aux_stats",
         "last_content_cross_attn_aux_stats",
+        "last_ref_audio_cfg_stats",
         "last_ref_content_suppression_stats",
         "last_progress_stop_aux_stats",
         "last_route_stats",
@@ -3104,6 +3211,15 @@ def collect_aux_loss_scalars(model: torch.nn.Module) -> dict[str, float | None]:
 def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
+    if int(args.lora_warmup_freeze_steps) < 0:
+        raise ValueError(
+            f"lora_warmup_freeze_steps must be non-negative, got {args.lora_warmup_freeze_steps}"
+        )
+    if float(args.content_cross_attn_lr_multiplier) < 0.0:
+        raise ValueError(
+            "content_cross_attn_lr_multiplier must be non-negative, "
+            f"got {args.content_cross_attn_lr_multiplier}"
+        )
     moss_root = deep_get(cfg, "moss.root")
     model_path = args.model_path or deep_get(cfg, "moss.model_path")
     codec_path = args.codec_path or deep_get(cfg, "moss.codec_path")
@@ -3182,6 +3298,7 @@ def main() -> int:
     args.speaker_infonce_negative_pool_size = timbre_memory_config.speaker_infonce_negative_pool_size
     args.speaker_infonce_negative_pool_seed = timbre_memory_config.speaker_infonce_negative_pool_seed
     args.speaker_condition_dropout = timbre_memory_config.speaker_condition_dropout
+    args.ref_audio_cfg_dropout = timbre_memory_config.ref_audio_cfg_dropout
     args.enable_speaker_side_pathway = timbre_memory_config.speaker_side_pathway_enabled
     args.speaker_side_pathway_layers = timbre_memory_config.speaker_side_pathway_layers
     args.speaker_side_pathway_kv_bias = timbre_memory_config.speaker_side_pathway_kv_bias
@@ -3260,6 +3377,7 @@ def main() -> int:
     args.content_cross_attn_gate_init = timbre_memory_config.content_cross_attn_gate_init
     args.content_cross_attn_dropout = timbre_memory_config.content_cross_attn_dropout
     args.content_cross_attn_output_scale = timbre_memory_config.content_cross_attn_output_scale
+    args.content_encoder_hidden_size = timbre_memory_config.content_encoder_hidden_size
     args.content_encoder_layers = timbre_memory_config.content_encoder_layers
     args.content_encoder_conv_kernel_size = timbre_memory_config.content_encoder_conv_kernel_size
     args.guided_attn_loss_weight = timbre_memory_config.guided_attn_loss_weight
@@ -3491,11 +3609,21 @@ def main() -> int:
         print(
             "[pack] timbre_side_only="
             f"{bool(args.timbre_side_only)} "
+            f"ref_audio_cfg_dropout={timbre_memory_config.ref_audio_cfg_dropout} "
             f"ref_content_suppression_weight={timbre_memory_config.ref_content_suppression_weight} "
             f"margin={timbre_memory_config.ref_content_suppression_margin} "
             f"source={timbre_memory_config.ref_content_suppression_source}",
             flush=True,
         )
+        if timbre_memory_config.content_cross_attn_enabled:
+            print(
+                "[pack] content_cross_attn="
+                f"layers={timbre_memory_config.content_cross_attn_layers} "
+                f"feature_dim={timbre_memory_config.content_cross_attn_feature_dim} "
+                f"encoder_hidden_size={timbre_memory_config.content_encoder_hidden_size} "
+                f"encoder_layers={timbre_memory_config.content_encoder_layers}",
+                flush=True,
+            )
         if bool(timbre_memory_config.ref_prompt_codec_permutation_enabled):
             prompt_perm = probe.get("timbre_ref_prompt_permutation")
             prompt_perm_values = prompt_perm.tolist() if torch.is_tensor(prompt_perm) else None
@@ -3612,6 +3740,8 @@ def main() -> int:
                     f"prosody={active_cfg.prosody_loss_weight:.4f} "
                     f"progress={active_cfg.progress_loss_weight:.4f} "
                     f"stop={active_cfg.stop_loss_weight:.4f} "
+                    f"content_encoder_hidden_size={active_cfg.content_encoder_hidden_size} "
+                    f"ref_audio_cfg_dropout={active_cfg.ref_audio_cfg_dropout:.4f} "
                     f"target_spk={active_cfg.target_speaker_similarity_weight:.4f} "
                     f"source_suppress={active_cfg.source_speaker_suppression_weight:.4f}",
                     flush=True,
@@ -3721,6 +3851,7 @@ def main() -> int:
         source_semantic_lr_multiplier=args.source_semantic_lr_multiplier,
         source_semantic_gate_lr_multiplier=args.source_semantic_gate_lr_multiplier,
         content_ctc_head_lr_multiplier=args.content_ctc_head_lr_multiplier,
+        content_cross_attn_lr_multiplier=args.content_cross_attn_lr_multiplier,
         timbre_adapter_gate_lr_multiplier=args.timbre_adapter_gate_lr_multiplier,
         ref_speaker_prompt_lr_multiplier=args.ref_speaker_prompt_lr_multiplier,
     )
@@ -3822,6 +3953,10 @@ def main() -> int:
             f"content_ctc_head_tensors={optimizer_group_summary['content_ctc_head_tensors']} "
             f"content_ctc_head_params={optimizer_group_summary['content_ctc_head_params']} "
             f"content_ctc_head_lr_multiplier={optimizer_group_summary['content_ctc_head_lr_multiplier']:.4g} "
+            f"content_cross_attn_tensors={optimizer_group_summary['content_cross_attn_tensors']} "
+            f"content_cross_attn_params={optimizer_group_summary['content_cross_attn_params']} "
+            f"content_cross_attn_lr_multiplier={optimizer_group_summary['content_cross_attn_lr_multiplier']:.4g} "
+            f"content_cross_attn_lr={args.learning_rate * optimizer_group_summary['content_cross_attn_lr_multiplier']:.4g} "
             f"ref_speaker_prompt_tensors={optimizer_group_summary['ref_speaker_prompt_tensors']} "
             f"ref_speaker_prompt_params={optimizer_group_summary['ref_speaker_prompt_params']} "
             f"ref_speaker_prompt_lr_multiplier={optimizer_group_summary['ref_speaker_prompt_lr_multiplier']:.4g} "
@@ -3861,6 +3996,11 @@ def main() -> int:
             f"scheduler_warmup_steps={scheduler_warmup_steps} "
             f"scheduler_training_steps={scheduler_training_steps}"
         )
+        print(
+            "[lora_warmup] "
+            f"freeze_optimizer_updates={int(args.lora_warmup_freeze_steps)} "
+            "policy=clear_grad_before_optimizer_step"
+        )
         if timbre_memory_config.enabled:
             print(
                 "[speaker_loss_schedule] "
@@ -3889,6 +4029,7 @@ def main() -> int:
                 f"infonce_neg_pool={timbre_memory_config.speaker_infonce_negative_pool_size} "
                 f"infonce_neg_pool_seed={timbre_memory_config.speaker_infonce_negative_pool_seed} "
                 f"condition_dropout={timbre_memory_config.speaker_condition_dropout:.4f} "
+                f"ref_audio_cfg_dropout={timbre_memory_config.ref_audio_cfg_dropout:.4f} "
                 f"speaker_side={timbre_memory_config.speaker_side_pathway_enabled} "
                 f"speaker_side_layers={timbre_memory_config.speaker_side_pathway_layers} "
                 f"speaker_side_kv={timbre_memory_config.speaker_side_pathway_kv_bias} "
@@ -3906,6 +4047,15 @@ def main() -> int:
                 f"speaker_cross_attn_alpha_warmup_steps={timbre_memory_config.speaker_cross_attn_alpha_warmup_steps} "
                 f"use_perturbed_source_prompt={timbre_memory_config.use_perturbed_source_prompt}"
             )
+            if timbre_memory_config.content_cross_attn_enabled:
+                print(
+                    "[content_cross_attn] "
+                    f"layers={timbre_memory_config.content_cross_attn_layers} "
+                    f"feature_dim={timbre_memory_config.content_cross_attn_feature_dim} "
+                    f"encoder_hidden_size={timbre_memory_config.content_encoder_hidden_size} "
+                    f"encoder_layers={timbre_memory_config.content_encoder_layers} "
+                    f"lr_multiplier={args.content_cross_attn_lr_multiplier:.4g}"
+                )
     else:
         train_log_handle = None
         tb_writer = None
@@ -4118,6 +4268,8 @@ def main() -> int:
     last_speaker_cross_attn_gate_grad_norm = 0.0
     last_content_cross_attn_grad_norm = 0.0
     last_content_cross_attn_gate_grad_norm = 0.0
+    lora_warmup_active = False
+    last_lora_warmup_cleared_tensors = 0
     speaker_side_max_grad_norms: dict[str, dict[str, float]] = {
         "adaln": {},
         "kv_bias": {},
@@ -4243,6 +4395,7 @@ def main() -> int:
                 route_stats: dict[str, float] = {}
                 speaker_side_stats: dict[str, float] = {}
                 target_front_ce_stats: dict[str, float] = {}
+                ref_audio_cfg_stats: dict[str, float] = {}
                 if timbre_memory_config.enabled:
                     unwrapped_for_stats = accelerator.unwrap_model(model)
                     speaker_aux_loss_value = getattr(unwrapped_for_stats, "last_speaker_aux_loss", None)
@@ -4291,6 +4444,7 @@ def main() -> int:
                     route_stats = getattr(unwrapped_for_stats, "last_route_stats", {}) or {}
                     speaker_side_stats = getattr(unwrapped_for_stats, "last_speaker_side_stats", {}) or {}
                     target_front_ce_stats = getattr(unwrapped_for_stats, "last_target_front_ce_stats", {}) or {}
+                    ref_audio_cfg_stats = getattr(unwrapped_for_stats, "last_ref_audio_cfg_stats", {}) or {}
                 if (
                     timbre_memory_config.enabled
                     and timbre_memory_config.source_semantic_memory_enabled
@@ -4302,11 +4456,20 @@ def main() -> int:
 
                 if accelerator.sync_gradients:
                     sync_ignored_trainable_grads(ignored_modules_for_manual_grad_sync)
+                    lora_warmup_active = global_step < int(args.lora_warmup_freeze_steps)
+                    last_lora_warmup_cleared_tensors = 0
+                    if lora_warmup_active:
+                        # Capture the raw gradient for diagnostics, then use grad=None so
+                        # AdamW skips both the parameter update and decoupled weight decay.
+                        last_lora_grad_norm, has_nonzero = lora_grad_stats(model)
+                        saw_nonzero_lora_grad = saw_nonzero_lora_grad or has_nonzero
+                        last_lora_warmup_cleared_tensors = clear_lora_grads(model)
                 if accelerator.sync_gradients and args.max_grad_norm > 0:
                     clip_mixed_dtype_trainable_grad_norm_(model, args.max_grad_norm)
                 if accelerator.sync_gradients:
-                    last_lora_grad_norm, has_nonzero = lora_grad_stats(model)
-                    saw_nonzero_lora_grad = saw_nonzero_lora_grad or has_nonzero
+                    if not lora_warmup_active:
+                        last_lora_grad_norm, has_nonzero = lora_grad_stats(model)
+                        saw_nonzero_lora_grad = saw_nonzero_lora_grad or has_nonzero
                     if timbre_memory_config.enabled:
                         last_timbre_grad_norm, has_nonzero_timbre = timbre_adapter_grad_stats(model)
                         saw_nonzero_timbre_grad = saw_nonzero_timbre_grad or has_nonzero_timbre
@@ -4439,6 +4602,24 @@ def main() -> int:
                         tb_writer.add_scalar("train/loss", logged_loss, global_step)
                         tb_writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], global_step)
                         tb_writer.add_scalar("train/lora_grad_norm", last_lora_grad_norm, global_step)
+                        tb_writer.add_scalar(
+                            "train/lora_warmup_active",
+                            float(lora_warmup_active),
+                            global_step,
+                        )
+                        tb_writer.add_scalar(
+                            "train/lora_warmup_cleared_tensors",
+                            float(last_lora_warmup_cleared_tensors),
+                            global_step,
+                        )
+                        content_group_index = int(optimizer_group_summary["content_cross_attn_group_index"])
+                        current_group_lrs = lr_scheduler.get_last_lr()
+                        if 0 <= content_group_index < len(current_group_lrs):
+                            tb_writer.add_scalar(
+                                "train/content_cross_attn_lr",
+                                current_group_lrs[content_group_index],
+                                global_step,
+                            )
                         tb_writer.add_scalar("train/global_batch_size_estimate", estimated_global_batch_size, global_step)
                         tb_writer.add_scalar("train/samples_seen_estimate", samples_seen, global_step)
                         tb_writer.add_scalar("train/epoch_fraction_estimate", epoch_fraction, global_step)
@@ -4584,13 +4765,17 @@ def main() -> int:
                                 tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
                             for stat_name, stat_value in target_front_ce_stats.items():
                                 tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
+                            for stat_name, stat_value in ref_audio_cfg_stats.items():
+                                tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
                             for stat_name, stat_value in routing_gate_delta_values.items():
                                 tb_writer.add_scalar(f"train/{stat_name}", float(stat_value), global_step)
                         tb_writer.add_scalar("train/epoch", epoch, global_step)
                     msg = (
                         f"step={global_step}/{max_train_steps} epoch={epoch} "
                         f"loss={logged_loss:.4f} lr={lr_scheduler.get_last_lr()[0]:.2e} "
-                        f"lora_grad_norm={last_lora_grad_norm:.4f}"
+                        f"lora_grad_norm={last_lora_grad_norm:.4f} "
+                        f"lora_warmup_active={int(lora_warmup_active)} "
+                        f"lora_warmup_cleared_tensors={last_lora_warmup_cleared_tensors}"
                     )
                     if timbre_memory_config.enabled:
                         msg += f" timbre_adapter_grad_norm={last_timbre_grad_norm:.4f}"
@@ -4646,6 +4831,23 @@ def main() -> int:
                             msg += f" content_guided_attn_loss={content_cross_attn_aux_stats['content_guided_attn_loss']:.4f}"
                         if "content_phoneme_classifier_loss" in content_cross_attn_aux_stats:
                             msg += f" content_phoneme_loss={content_cross_attn_aux_stats['content_phoneme_classifier_loss']:.4f}"
+                        if "content_phoneme_classifier_acc" in content_cross_attn_aux_stats:
+                            msg += (
+                                " content_phoneme_classifier_acc="
+                                f"{content_cross_attn_aux_stats['content_phoneme_classifier_acc']:.4f}"
+                            )
+                        if "content_cross_attn_memory_dim" in content_cross_attn_aux_stats:
+                            msg += (
+                                " content_cross_attn_memory_dim="
+                                f"{content_cross_attn_aux_stats['content_cross_attn_memory_dim']:.0f}"
+                            )
+                        if "ref_audio_cfg_dropped_rows" in ref_audio_cfg_stats:
+                            msg += f" ref_audio_cfg_dropped_rows={ref_audio_cfg_stats['ref_audio_cfg_dropped_rows']:.0f}"
+                        if "ref_audio_cfg_dropped_positions" in ref_audio_cfg_stats:
+                            msg += (
+                                " ref_audio_cfg_dropped_positions="
+                                f"{ref_audio_cfg_stats['ref_audio_cfg_dropped_positions']:.0f}"
+                            )
                         if "source_semantic_gate_mean" in source_semantic_aux_stats:
                             msg += f" source_semantic_gate_mean={source_semantic_aux_stats['source_semantic_gate_mean']:.4f}"
                         if "source_semantic_delta_ratio" in source_semantic_aux_stats:
