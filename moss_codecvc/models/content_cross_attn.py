@@ -179,6 +179,7 @@ class ContentCrossAttentionLayer(nn.Module):
         self,
         hidden_size: int,
         *,
+        memory_size: int | None = None,
         num_heads: int = 8,
         adapter_dim: int = 256,
         dropout: float = 0.0,
@@ -188,16 +189,20 @@ class ContentCrossAttentionLayer(nn.Module):
         super().__init__()
         if int(hidden_size) <= 0:
             raise ValueError("hidden_size must be positive")
+        memory_size = int(hidden_size) if memory_size is None else int(memory_size)
+        if memory_size <= 0:
+            raise ValueError("memory_size must be positive")
         adapter_dim = max(1, min(int(adapter_dim), int(hidden_size)))
         num_heads = _valid_num_heads(adapter_dim, int(num_heads))
         self.hidden_size = int(hidden_size)
+        self.memory_size = int(memory_size)
         self.adapter_dim = int(adapter_dim)
         self.num_heads = int(num_heads)
         self.output_scale = float(output_scale)
         self.query_norm = nn.LayerNorm(self.hidden_size)
-        self.memory_norm = nn.LayerNorm(self.hidden_size)
+        self.memory_norm = nn.LayerNorm(self.memory_size)
         self.query_down = nn.Linear(self.hidden_size, self.adapter_dim)
-        self.memory_down = nn.Linear(self.hidden_size, self.adapter_dim)
+        self.memory_down = nn.Linear(self.memory_size, self.adapter_dim)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=self.adapter_dim,
             num_heads=self.num_heads,
@@ -225,7 +230,7 @@ class ContentCrossAttentionLayer(nn.Module):
         batch_size, _target_len, hidden_size = hidden_states.shape
         if int(hidden_size) != self.hidden_size:
             raise ValueError(f"hidden size mismatch: got {hidden_size}, expected {self.hidden_size}")
-        if content_memory.shape[0] != batch_size or int(content_memory.shape[-1]) != self.hidden_size:
+        if content_memory.shape[0] != batch_size or int(content_memory.shape[-1]) != self.memory_size:
             raise ValueError("content_memory shape does not match hidden_states")
         target_mask = target_mask.to(device=hidden_states.device).bool()
         if target_mask.shape != hidden_states.shape[:2]:
