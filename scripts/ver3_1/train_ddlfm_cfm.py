@@ -345,7 +345,15 @@ def main() -> int:
     )
     module = DDLFMTrainModule(args).to(device)
     if use_dist:
-        module = DistributedDataParallel(module, device_ids=[device.index], broadcast_buffers=False)
+        # A local rank can receive a homogeneous no_text or text batch even
+        # though the global sampler mixes both modes.  The text-only memory
+        # encoder is therefore legitimately unused on some ranks/steps.
+        module = DistributedDataParallel(
+            module,
+            device_ids=[device.index],
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
     raw_module = module.module if isinstance(module, DistributedDataParallel) else module
     optimizer = torch.optim.AdamW(module.parameters(), lr=float(args.lr), betas=(0.9, 0.95), weight_decay=0.01)
     use_amp = device.type == "cuda" and args.precision in {"bf16", "fp16"}

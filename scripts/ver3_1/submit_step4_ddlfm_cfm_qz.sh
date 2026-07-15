@@ -209,7 +209,7 @@ cat >"$RECORD_ROOT/preflight.json" <<EOF
   "dry_run": $DRY_RUN,
   "resource": {"compute_group": "$COMPUTE_GROUP", "compute_group_name": "MTTS-3-2-0715", "spec": "$SPEC", "instances": 1, "gpus": 8, "gpu_type": "$GPU_TYPE"},
   "input": {"index": "$INDEX", "index_sha256": "$INDEX_SHA256", "rows": $INDEX_ROWS, "zq_summary": "$ZQ_SUMMARY", "semantic_summary": "$SEMANTIC_COMPLETION", "semantic_report": "$SEMANTIC_SUMMARY"},
-  "contract": {"target": "zq dequantized decoder latent [T,768] @ 12.5Hz", "no_text_semantic": "WavLM-base-plus layer9 adapter [T,512]", "text_semantic": "content_token_ids -> SourceTokenMemoryEncoder [L,512]", "speaker": "existing ECAPA 192-D sidecar", "steps": $STEPS, "per_device_batch": $PER_DEVICE_BATCH, "grad_accum_steps": $GRAD_ACCUM_STEPS, "global_batch": $((PER_DEVICE_BATCH * GRAD_ACCUM_STEPS * 8)), "lr": 0.0001, "warmup_steps": $WARMUP_STEPS, "save_every": $SAVE_STEPS, "max_frames": $MAX_FRAMES, "precision": "$PRECISION"},
+  "contract": {"target": "zq dequantized decoder latent [T,768] @ 12.5Hz", "no_text_semantic": "WavLM-base-plus layer9 adapter [T,512]", "text_semantic": "content_token_ids -> SourceTokenMemoryEncoder [L,512]", "speaker": "existing ECAPA 192-D sidecar", "ddp_find_unused_parameters": true, "steps": $STEPS, "per_device_batch": $PER_DEVICE_BATCH, "grad_accum_steps": $GRAD_ACCUM_STEPS, "global_batch": $((PER_DEVICE_BATCH * GRAD_ACCUM_STEPS * 8)), "lr": 0.0001, "warmup_steps": $WARMUP_STEPS, "save_every": $SAVE_STEPS, "max_frames": $MAX_FRAMES, "precision": "$PRECISION"},
   "record_root": "$RECORD_ROOT",
   "snapshot_root": "$SNAPSHOT_ROOT",
   "runner": "$RUNNER"
@@ -226,11 +226,11 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
-LOCK="$ROOT/trainset/qz_jobs/.codecVC-ver3-1-step4-ddlfm.live_submission.lock"
+LOCK="${LIVE_LOCK:-$ROOT/trainset/qz_jobs/.${BATCH_ID}.live_submission.lock}"
 mkdir -p "$(dirname "$LOCK")"
 mkdir "$LOCK" 2>/dev/null || die "submission lock exists: $LOCK"
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
-LEDGER="$ROOT/trainset/qz_jobs/codecVC-ver3-1-step4-ddlfm.submitted_jobs.tsv"
+LEDGER="${SUBMISSION_LEDGER:-$ROOT/trainset/qz_jobs/${BATCH_ID}.submitted_jobs.tsv}"
 [ ! -s "$LEDGER" ] || die "Step 4 submission ledger already exists"
 SUBMIT_OUT="$RECORD_ROOT/submit_output.txt"
 set +e
