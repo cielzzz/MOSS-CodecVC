@@ -60,6 +60,7 @@ sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 [ -x "$QZCLI" ] || die "missing qzcli: $QZCLI"
 [ -x "$PY" ] || die "missing Python: $PY"
 [ -x "$TORCHRUN" ] || die "missing torchrun: $TORCHRUN"
+[ -z "$(git -C "$ROOT" status --porcelain)" ] || die "worktree must be clean before Step 4 submission"
 [ "$COMPUTE_GROUP" = "$ALLOWED_COMPUTE_GROUP" ] || die "only MTTS-3-2-0715 is allowed"
 [ "$SPEC" = "$ALLOWED_SPEC" ] || die "only registered 8xH200 spec is allowed"
 [ "$GPU_TYPE" = "NVIDIA_H200_SXM_141G" ] || die "only NVIDIA_H200_SXM_141G is allowed"
