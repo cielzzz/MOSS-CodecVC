@@ -16,6 +16,7 @@ from .moss_codecvc_wrapper import (
 )
 from .speaker_cross_attn import SpeakerCrossAttentionLayer, SpeakerTokenProjector
 from .content_cross_attn import ContentConformerEncoder, ContentCrossAttentionLayer, ContentPhonemeClassifierHead
+from .content_adapter_v3_1 import ContentAdapterOutput, ContentAdapterV31, count_parameters
 from .auxiliary_losses import (
     ContentCTCHead,
     ContentEmbeddingHead,
@@ -57,6 +58,9 @@ __all__ = [
     "ContentConformerEncoder",
     "ContentCrossAttentionLayer",
     "ContentPhonemeClassifierHead",
+    "ContentAdapterOutput",
+    "ContentAdapterV31",
+    "count_parameters",
     "FrozenSpeakerEmbeddingLoader",
     "FrozenSpeechBrainECAPAEncoder",
     "FrozenSeedTTSEvalECAPAEncoder",
