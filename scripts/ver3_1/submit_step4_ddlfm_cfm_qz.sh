@@ -233,11 +233,11 @@ LEDGER="$ROOT/trainset/qz_jobs/codecVC-ver3-1-step4-ddlfm.submitted_jobs.tsv"
 [ ! -s "$LEDGER" ] || die "Step 4 submission ledger already exists"
 SUBMIT_OUT="$RECORD_ROOT/submit_output.txt"
 set +e
-env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \\
-  QZCLI_GPU_TYPE_OVERRIDE="$GPU_TYPE" "$QZCLI" create-job \\
-  --name "$JOB_NAME" --workspace "$WORKSPACE" --project "$PROJECT" \\
-  --compute-group "$COMPUTE_GROUP" --spec "$SPEC" --framework "$FRAMEWORK" \\
-  --instances 1 --shm "$SHM_GI" --priority "$PRIORITY" --image "$IMAGE" \\
+env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+  QZCLI_GPU_TYPE_OVERRIDE="$GPU_TYPE" "$QZCLI" create-job \
+  --name "$JOB_NAME" --workspace "$WORKSPACE" --project "$PROJECT" \
+  --compute-group "$COMPUTE_GROUP" --spec "$SPEC" --framework "$FRAMEWORK" \
+  --instances 1 --shm "$SHM_GI" --priority "$PRIORITY" --image "$IMAGE" \
   --image-type "$IMAGE_TYPE" --command "bash $RUNNER" >"$SUBMIT_OUT" 2>&1
 STATUS=$?
 set -e
