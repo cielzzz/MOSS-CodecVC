@@ -592,7 +592,8 @@ class PersistentCodecVCInfer:
             f"min_new_tokens={min_new_tokens} min_audio_tokens={min_audio_tokens} "
             f"stop_head_budget={int(stop_head_budget_active)} "
             f"audio_top_k={gen_kwargs['audio_top_k']} "
-            f"timbre_cfg_scale={float(args.timbre_cfg_scale):.3f}",
+            f"timbre_cfg_scale={float(args.timbre_cfg_scale):.3f} "
+            f"ref_audio_cfg_scale={float(args.ref_audio_cfg_scale):.3f}",
             flush=True,
         )
         return gen_kwargs, min_new_tokens, min_audio_tokens
@@ -731,6 +732,7 @@ class PersistentCodecVCInfer:
         )
         if self.use_timbre_memory:
             gen_kwargs["timbre_cfg_scale"] = float(args.timbre_cfg_scale)
+            gen_kwargs["ref_audio_cfg_scale"] = float(args.ref_audio_cfg_scale)
             mode_id = int(getattr(self.model, "MODE_TO_ID", {}).get(vc_mode, 0))
             if mode_id > 0:
                 gen_kwargs["vc_mode_id"] = torch.tensor([mode_id], dtype=torch.long, device=self.device)
@@ -809,7 +811,8 @@ class PersistentCodecVCInfer:
                 or "hubert_continuous"
             ).strip().lower()
             source_content_memory_type = self.mod.normalize_source_content_memory_type(source_content_memory_type)
-            needs_source_content_features = source_semantic_encoder is not None or content_cross_attn_encoder is not None
+            content_cross_attn_needs_features = content_cross_attn_encoder is not None and no_text
+            needs_source_content_features = source_semantic_encoder is not None or content_cross_attn_needs_features
             should_use_source_semantic = (
                 needs_source_content_features
                 and not args.disable_source_semantic_memory
@@ -817,7 +820,7 @@ class PersistentCodecVCInfer:
                     no_text
                     or abs(text_gate) > 1.0e-6
                     or learned_text_gate
-                    or content_cross_attn_encoder is not None
+                    or content_cross_attn_needs_features
                 )
             )
             if should_use_source_semantic:
@@ -951,6 +954,7 @@ class PersistentCodecVCInfer:
                     "mode": row.get("mode"),
                     "cell": row.get("cell"),
                     "timbre_cfg_scale": float(args.timbre_cfg_scale),
+                    "ref_audio_cfg_scale": float(args.ref_audio_cfg_scale),
                     "output": [
                         (int(start_length), cur_generation_ids.detach().cpu())
                         for start_length, cur_generation_ids in output
@@ -1009,6 +1013,7 @@ class PersistentCodecVCInfer:
             "generation_stop_head_budget": bool(self.stop_head_budget),
             "generation_structure": first_stats,
             "timbre_cfg_scale": float(args.timbre_cfg_scale),
+            "ref_audio_cfg_scale": float(args.ref_audio_cfg_scale),
             "speaker_vec_path": speaker_vec_path,
             "speaker_seq_path": speaker_seq_path,
             "ref_prompt_codec_permutation": ref_prompt_permutation_stats,
@@ -1122,6 +1127,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=env_float("TIMBRE_CFG_SCALE", 1.0),
         help="Classifier-free guidance scale for S2 speaker conditioning.",
+    )
+    ap.add_argument(
+        "--ref-audio-cfg-scale",
+        type=float,
+        default=env_float("REF_AUDIO_CFG_SCALE", 1.0),
+        help="Classifier-free guidance scale for the in-sequence C_ref audio prompt.",
     )
     ap.add_argument("--source-semantic-feature-path", default=env_str("SOURCE_SEMANTIC_FEATURE_PATH", ""))
     ap.add_argument("--source-content-token-ids", default=env_str("SOURCE_CONTENT_TOKEN_IDS", ""))
