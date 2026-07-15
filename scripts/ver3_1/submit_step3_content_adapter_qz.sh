@@ -69,6 +69,9 @@ if [ "${VERIFY_INPUT_SHA:-0}" = "1" ]; then
   [ "$(sha256_file "$MANIFEST")" = "$MANIFEST_SHA256" ] || die "v1 manifest SHA256 changed"
 fi
 [ ! -e "$OUTPUT_ROOT/COMPLETED.json" ] || die "adapter output already complete"
+if [ -d "$OUTPUT_ROOT" ] && [ -n "$(find "$OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] && [ "${ALLOW_NONEMPTY_OUTPUT:-0}" != "1" ]; then
+  die "adapter output root is non-empty; choose a fresh OUTPUT_ROOT or set ALLOW_NONEMPTY_OUTPUT=1 explicitly"
+fi
 case "$DRY_RUN" in 0|1) ;; *) die "DRY_RUN must be 0 or 1" ;; esac
 if [ "$DRY_RUN" = "0" ] && [ "${ALLOW_CODECVC_VER3_1_STEP3_SUBMIT:-0}" != "1" ]; then
   die "live submission guarded; set DRY_RUN=0 ALLOW_CODECVC_VER3_1_STEP3_SUBMIT=1"
@@ -76,7 +79,10 @@ fi
 
 mkdir -p "$SNAPSHOT_ROOT/scripts/ver3_1" "$SNAPSHOT_ROOT/moss_codecvc/models"
 cp -p "$TRAIN_SCRIPT" "$SNAPSHOT_ROOT/scripts/ver3_1/"
-cp -p "$ADAPTER_MODULE" "$CONTENT_ATTN" "$CONFIG_MODULE" "$AUXILIARY_MODULE" "$SNAPSHOT_ROOT/moss_codecvc/models/"
+# Copy the small Python package, not only the four immediate imports.  The
+# package initializers export legacy modules, so a partial snapshot can still
+# resolve code from the live checkout and defeat reproducibility.
+cp -a "$ROOT/moss_codecvc/." "$SNAPSHOT_ROOT/moss_codecvc/"
 SOURCE_GIT_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 find "$SNAPSHOT_ROOT" -type f -print0 | sort -z | xargs -0 sha256sum >"$SNAPSHOT_ROOT/SHA256SUMS"
 printf '%s\n' "$SOURCE_GIT_SHA" >"$SNAPSHOT_ROOT/SOURCE_GIT_SHA"
@@ -98,7 +104,9 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="$ROOT\${PYTHONPATH:+:\$PYTHONPATH}"
+# Put the immutable snapshot first; otherwise imports silently resolve to a
+# dirty live checkout and the recorded SHA256SUMS is not the code being run.
+export PYTHONPATH="$SNAPSHOT_ROOT:$ROOT\${PYTHONPATH:+:\$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export OMP_NUM_THREADS=8
 cd "\$ROOT"
