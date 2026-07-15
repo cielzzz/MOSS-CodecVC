@@ -17,7 +17,6 @@ training process cannot leave partially published WAVs.
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import math
 import os
@@ -313,6 +312,20 @@ def save_checkpoint(
     torch.save({"step": int(step), "model": state, "config": vars(args)}, output_dir / "last.pt")
 
 
+def infinite_loader(loader: DataLoader):
+    """Yield batches forever without ``itertools.cycle``'s unbounded cache.
+
+    ``itertools.cycle(loader)`` retains every batch from the first pass so it
+    can replay them.  With the full v1 index that silently grows host memory
+    for the duration of the probe.  Re-entering the DataLoader iterator at
+    epoch boundaries preserves the intended shuffle behavior without retaining
+    any batch tensors.
+    """
+    while True:
+        for batch in loader:
+            yield batch
+
+
 def main() -> int:
     args = parse_args()
     use_dist, rank, world_size, device = init_distributed()
@@ -337,17 +350,21 @@ def main() -> int:
     optimizer = torch.optim.AdamW(module.parameters(), lr=float(args.lr), betas=(0.9, 0.95), weight_decay=0.01)
     use_amp = device.type == "cuda" and args.precision in {"bf16", "fp16"}
     amp_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and args.precision == "fp16")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and args.precision == "fp16")
     log_path = output_dir / "train_log.jsonl"
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "config.json").write_text(json.dumps(vars(args), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    iterator = itertools.cycle(loader)
+    iterator = infinite_loader(loader)
     started = time.time()
     grad_accum_steps = max(1, int(args.grad_accum_steps))
     for step in range(1, int(args.steps) + 1):
         if sampler is not None and (step - 1) % max(1, len(loader)) == 0:
             sampler.set_epoch((step - 1) // max(1, len(loader)))
+        warmup_scale = min(1.0, float(step) / max(1, int(args.warmup_steps)))
+        current_lr = float(args.lr) * warmup_scale
+        for group in optimizer.param_groups:
+            group["lr"] = current_lr
         optimizer.zero_grad(set_to_none=True)
         loss_total = 0.0
         for _micro_step in range(grad_accum_steps):
@@ -379,14 +396,11 @@ def main() -> int:
         torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
-        warmup_scale = min(1.0, float(step) / max(1, int(args.warmup_steps)))
-        for group in optimizer.param_groups:
-            group["lr"] = float(args.lr) * warmup_scale
         if rank == 0 and (step == 1 or step % max(1, int(args.log_every)) == 0):
             payload = {
                 "step": step,
                 "loss": loss_total / float(grad_accum_steps),
-                "lr": float(optimizer.param_groups[0]["lr"]),
+                "lr": current_lr,
                 "elapsed_sec": time.time() - started,
                 "world_size": world_size,
                 "rows": len(dataset),
