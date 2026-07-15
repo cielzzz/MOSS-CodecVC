@@ -23,6 +23,7 @@ __pycache__/
 trainset/
 testset/
 outputs/
+prepared/
 logs/
 tmp/
 cache/
