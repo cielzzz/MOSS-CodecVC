@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--grad-accum-steps", type=int, default=2)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--lr", type=float, default=1.0e-4)
     ap.add_argument("--warmup-steps", type=int, default=1000)
@@ -343,32 +344,37 @@ def main() -> int:
         (output_dir / "config.json").write_text(json.dumps(vars(args), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     iterator = itertools.cycle(loader)
     started = time.time()
+    grad_accum_steps = max(1, int(args.grad_accum_steps))
     for step in range(1, int(args.steps) + 1):
         if sampler is not None and (step - 1) % max(1, len(loader)) == 0:
             sampler.set_epoch((step - 1) // max(1, len(loader)))
-        batch = next(iterator)
-        batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        target = batch["zq"]
-        t = torch.rand(target.shape[0], device=device)
-        noise = torch.randn_like(target)
-        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * target
-        v_target = target - noise
-        semantic, semantic_mask = raw_module.build_semantic(batch)
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            prediction = module(
-                x_t,
-                t,
-                semantic,
-                batch["speaker"],
-                target_mask=batch["target_mask"],
-                semantic_mask=semantic_mask,
-                semantic_modality=batch["mode"],
-            ).velocity
-            loss = masked_mse(prediction, v_target, batch["target_mask"])
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite CFM loss at step {step}: {loss}")
-        scaler.scale(loss).backward()
+        loss_total = 0.0
+        for _micro_step in range(grad_accum_steps):
+            batch = next(iterator)
+            batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            target = batch["zq"]
+            t = torch.rand(target.shape[0], device=device)
+            noise = torch.randn_like(target)
+            x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * target
+            v_target = target - noise
+            semantic, semantic_mask = raw_module.build_semantic(batch)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                prediction = module(
+                    x_t,
+                    t,
+                    semantic,
+                    batch["speaker"],
+                    target_mask=batch["target_mask"],
+                    semantic_mask=semantic_mask,
+                    semantic_modality=batch["mode"],
+                ).velocity
+                loss = masked_mse(prediction, v_target, batch["target_mask"])
+                scaled_loss = loss / float(grad_accum_steps)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite CFM loss at step {step}: {loss}")
+            loss_total += float(loss.detach().cpu().item())
+            scaler.scale(scaled_loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
         scaler.step(optimizer)
@@ -379,7 +385,7 @@ def main() -> int:
         if rank == 0 and (step == 1 or step % max(1, int(args.log_every)) == 0):
             payload = {
                 "step": step,
-                "loss": float(loss.detach().cpu().item()),
+                "loss": loss_total / float(grad_accum_steps),
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "elapsed_sec": time.time() - started,
                 "world_size": world_size,
