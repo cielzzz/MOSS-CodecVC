@@ -275,6 +275,14 @@ def sha256_file(path: Path) -> str:
 
 def extract(args: argparse.Namespace) -> int:
     specs = parse_specs(args.input)
+    # A torchrun wrapper can launch one extractor per GPU without duplicating
+    # CLI arguments.  Explicit CLI shard values still take precedence for
+    # local/manual runs.
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world_size > 1 and int(args.num_shards) == 1 and int(args.shard_index) == 0:
+        args.num_shards = world_size
+        args.shard_index = rank
     mode_filter = parse_mode_filter(args.mode_filter)
     if int(args.num_shards) <= 0 or not 0 <= int(args.shard_index) < int(args.num_shards):
         raise ValueError("invalid shard index/num-shards")
