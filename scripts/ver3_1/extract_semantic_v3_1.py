@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--shard-index", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--max-rows", type=int, default=0)
+    ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--progress-every", type=int, default=1000)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument(
@@ -273,6 +274,68 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _write_semantic_batch(
+    pending: list[tuple[str, int, dict[str, Any], torch.Tensor, str]],
+    *,
+    adapter: ContentAdapterV31,
+    device: torch.device,
+    output_root: Path,
+    checkpoint: Path,
+    save_dtype: str,
+    full_manifest: bool,
+    stats: dict[str, Any],
+    out_handle: Any,
+) -> None:
+    """Run one padded adapter forward and write each row's semantic tensor."""
+    if not pending:
+        return
+    max_frames = max(int(item[3].shape[0]) for item in pending)
+    feature_dim = int(pending[0][3].shape[1])
+    batch_features = torch.zeros(
+        (len(pending), max_frames, feature_dim), dtype=torch.float32, device=device
+    )
+    batch_mask = torch.zeros((len(pending), max_frames), dtype=torch.bool, device=device)
+    for index, (_split, _line_no, _row, feature, _kind) in enumerate(pending):
+        frames = int(feature.shape[0])
+        batch_features[index, :frames] = feature.to(device=device)
+        batch_mask[index, :frames] = True
+    with torch.no_grad():
+        output = adapter(batch_features, batch_mask)
+    for index, (split, line_no, row, _feature, feature_kind) in enumerate(pending):
+        semantic = output.semantic[index, output.semantic_mask[index]].detach().float().cpu().numpy()
+        if semantic.ndim != 2 or semantic.shape[0] <= 0:
+            raise ValueError(f"empty adapter output for {row.get('sample_id')}")
+        if save_dtype == "float16":
+            semantic = semantic.astype(np.float16, copy=False)
+        else:
+            semantic = semantic.astype(np.float32, copy=False)
+        uid = safe_id(split, row, line_no)
+        destination = output_root / split / f"{uid}.npy"
+        if destination.exists() and not getattr(_write_semantic_batch, "overwrite", False):
+            stats["reused"] += 1
+        else:
+            atomic_npy(destination, semantic)
+            stats["written"] += 1
+        stats["frames"] += int(semantic.shape[0])
+        mode = row_mode(row, split)
+        record = dict(row) if full_manifest else {
+            "sample_id": str(row.get("sample_id") or row.get("utt_id") or f"line-{line_no}"),
+            "utt_id": row.get("utt_id"),
+            "moss_codecvc_mode": mode,
+            "language": row.get("language"),
+            "split": split,
+        }
+        record["semantic_v3_1_path"] = str(destination)
+        record["semantic_v3_1_frames"] = int(semantic.shape[0])
+        record["semantic_v3_1_dim"] = int(semantic.shape[1])
+        record["semantic_v3_1_rate_hz"] = 12.5
+        record["semantic_v3_1_feature_kind"] = feature_kind
+        record["semantic_v3_1_adapter_checkpoint"] = str(checkpoint)
+        record["semantic_v3_1_sha256"] = sha256_file(destination)
+        out_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    pending.clear()
+
+
 def extract(args: argparse.Namespace) -> int:
     specs = parse_specs(args.input)
     # A torchrun wrapper can launch one extractor per GPU without duplicating
@@ -314,6 +377,10 @@ def extract(args: argparse.Namespace) -> int:
         "checkpoint": str(checkpoint),
         "label_source": adapter_cfg.get("label_source_probe"),
     }
+    if int(args.batch_size) <= 0:
+        raise ValueError("--batch-size must be positive")
+    _write_semantic_batch.overwrite = bool(args.overwrite)
+    pending: list[tuple[str, int, dict[str, Any], torch.Tensor, str]] = []
     with shard_path.open("w", encoding="utf-8") as out:
         for global_line, (split, line_no, row) in enumerate(iter_rows(specs)):
             if global_line % int(args.num_shards) != int(args.shard_index):
@@ -348,43 +415,35 @@ def extract(args: argparse.Namespace) -> int:
                     raise ValueError(
                         f"feature dim={feature.shape[-1]} != adapter input={adapter_cfg['input_dim']}"
                     )
-                with torch.no_grad():
-                    output = adapter(feature.unsqueeze(0).to(device), torch.ones((1, feature.shape[0]), dtype=torch.bool, device=device))
-                semantic = output.semantic[0, output.semantic_mask[0]].detach().float().cpu().numpy()
-                if semantic.ndim != 2 or semantic.shape[0] <= 0:
-                    raise ValueError(f"empty adapter output for {row.get('sample_id')}")
-                if args.save_dtype == "float16":
-                    semantic = semantic.astype(np.float16, copy=False)
-                else:
-                    semantic = semantic.astype(np.float32, copy=False)
-                uid = safe_id(split, row, line_no)
-                destination = output_root / split / f"{uid}.npy"
-                if destination.exists() and not args.overwrite:
-                    stats["reused"] += 1
-                else:
-                    atomic_npy(destination, semantic)
-                    stats["written"] += 1
-                stats["frames"] += int(semantic.shape[0])
-                record = dict(row) if args.full_manifest else {
-                    "sample_id": str(row.get("sample_id") or row.get("utt_id") or f"line-{line_no}"),
-                    "utt_id": row.get("utt_id"),
-                    "moss_codecvc_mode": mode,
-                    "language": row.get("language"),
-                    "split": split,
-                }
-                record["semantic_v3_1_path"] = str(destination)
-                record["semantic_v3_1_frames"] = int(semantic.shape[0])
-                record["semantic_v3_1_dim"] = int(semantic.shape[1])
-                record["semantic_v3_1_rate_hz"] = 12.5
-                record["semantic_v3_1_feature_kind"] = feature_kind
-                record["semantic_v3_1_adapter_checkpoint"] = str(checkpoint)
-                record["semantic_v3_1_sha256"] = sha256_file(destination)
-                out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                pending.append((split, line_no, row, feature, feature_kind))
+                if len(pending) >= int(args.batch_size):
+                    _write_semantic_batch(
+                        pending,
+                        adapter=adapter,
+                        device=device,
+                        output_root=output_root,
+                        checkpoint=checkpoint,
+                        save_dtype=args.save_dtype,
+                        full_manifest=bool(args.full_manifest),
+                        stats=stats,
+                        out_handle=out,
+                    )
             except Exception as exc:
                 stats["errors"] += 1
                 print(f"[semantic-v3.1] error split={split} line={line_no}: {exc}", file=sys.stderr, flush=True)
             if stats["scanned"] and stats["scanned"] % max(1, int(args.progress_every)) == 0:
                 print(json.dumps(stats, ensure_ascii=False), flush=True)
+        _write_semantic_batch(
+            pending,
+            adapter=adapter,
+            device=device,
+            output_root=output_root,
+            checkpoint=checkpoint,
+            save_dtype=args.save_dtype,
+            full_manifest=bool(args.full_manifest),
+            stats=stats,
+            out_handle=out,
+        )
     stats["status"] = "completed" if stats["errors"] == 0 else "completed_with_errors"
     stats["finished_at_utc"] = utc_now()
     marker = shard_path.with_suffix(".stats.json")

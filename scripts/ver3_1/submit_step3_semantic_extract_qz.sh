@@ -22,6 +22,7 @@ PRIORITY="${PRIORITY:-10}"
 GPU_TYPE="${GPU_TYPE:-NVIDIA_H200_SXM_141G}"
 DRY_RUN="${DRY_RUN:-1}"
 NUM_SHARDS="${NUM_SHARDS:-8}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-2000}"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BATCH_ID="${BATCH_ID:-codecVC-ver3-1-step3-semantic-no-text-$TIMESTAMP}"
@@ -94,7 +95,7 @@ for shard in \$(seq 0 $((NUM_SHARDS - 1))); do
     --input "no_text=\$MANIFEST" --checkpoint "\$CHECKPOINT" --output-root "\$OUTPUT_ROOT" \\
     --feature-key source_wavlm_bnf_features_path --mode-filter no_text \\
     --shard-index "\$shard" --num-shards "$NUM_SHARDS" --device cuda:0 \\
-    --precision bf16 --save-dtype float16 --progress-every "$PROGRESS_EVERY" \\
+    --precision bf16 --save-dtype float16 --batch-size "$BATCH_SIZE" --progress-every "$PROGRESS_EVERY" \\
     >"$LOG_ROOT/shard-\$(printf '%03d' \"\$shard\").log" 2>&1 &
   PIDS+=("\$!")
 done
@@ -118,7 +119,7 @@ cat >"$RECORD_ROOT/preflight.json" <<EOF
   "resource": {"compute_group": "$COMPUTE_GROUP", "compute_group_name": "MTTS-3-2-0715", "spec": "$SPEC", "instances": 1, "gpus": 8},
   "input": {"path": "$MANIFEST", "sha256": "$MANIFEST_SHA256", "rows": 310420, "mode": "no_text"},
   "checkpoint": {"path": "$CHECKPOINT", "semantic_dim": 512, "rate_hz": 12.5, "provenance": "Step-3 3k proxy-label adapter; no MFA phoneme gate"},
-  "output": {"root": "$OUTPUT_ROOT", "expected_split": "no_text", "num_shards": $NUM_SHARDS},
+  "output": {"root": "$OUTPUT_ROOT", "expected_split": "no_text", "num_shards": $NUM_SHARDS, "batch_size": $BATCH_SIZE},
   "record_root": "$RECORD_ROOT",
   "snapshot_root": "$SNAPSHOT_ROOT",
   "runner": "$RUNNER"
