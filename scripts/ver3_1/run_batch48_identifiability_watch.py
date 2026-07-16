@@ -132,7 +132,6 @@ def write_local_eval_contract(output_root: Path, checkpoint_root: Path) -> Path:
                 "--output-dir",
                 str(output_root / "full320_no_text"),
                 "--overwrite",
-                "# Add --checkpoint <step-003000.infer.pt> before execution.",
             ],
         },
     }
