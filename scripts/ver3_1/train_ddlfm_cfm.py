@@ -21,6 +21,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -37,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 from moss_codecvc.models.ddlfm_decoder import DDLFMDecoder
 from moss_codecvc.models.source_semantic_memory import SourceTokenMemoryEncoder
+from moss_codecvc.audio.zq_normalization import load_zq_channel_stats, sha256_file
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--grad-accum-steps", type=int, default=2)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--lr", type=float, default=1.0e-4)
-    ap.add_argument("--warmup-steps", type=int, default=1000)
-    ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--warmup-steps", type=int, default=3000)
+    ap.add_argument("--save-every", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--max-frames", type=int, default=256)
     ap.add_argument("--seed", type=int, default=20260715)
@@ -64,6 +66,49 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ffn-size", type=int, default=3072)
     ap.add_argument("--text-vocab-size", type=int, default=8001)
     ap.add_argument("--text-padding-id", type=int, default=0)
+    ap.add_argument(
+        "--mode",
+        choices=("no_text", "all"),
+        default="no_text",
+        help="Batch-46 M1 is deliberately no_text-only; 'all' is retained for diagnostics.",
+    )
+    ap.add_argument(
+        "--t-sampling",
+        choices=("logit_normal", "cosine", "uniform"),
+        default="logit_normal",
+    )
+    ap.add_argument("--t-logit-mu", type=float, default=0.0)
+    ap.add_argument("--t-logit-sigma", type=float, default=1.0)
+    ap.add_argument(
+        "--loss-weighting",
+        choices=("low_t", "high_t", "none"),
+        default="low_t",
+        help=(
+            "low_t uses 1/(t+eps) to emphasize the noise endpoint.  high_t keeps the "
+            "literal 1/(1-t+eps) alternative for controlled comparison."
+        ),
+    )
+    ap.add_argument("--loss-weight-eps", type=float, default=0.05)
+    ap.add_argument("--loss-weight-cap", type=float, default=5.0)
+    ap.add_argument("--speaker-dropout", type=float, default=0.10)
+    ap.add_argument("--cross-gate-init", type=float, default=0.05)
+    ap.add_argument("--gate-warmup-steps", type=int, default=500)
+    ap.add_argument("--gate-warmup-start", type=float, default=0.05)
+    ap.add_argument("--ema-decay", type=float, default=0.9999)
+    ap.add_argument(
+        "--ema-warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Ramp the effective EMA decay toward --ema-decay using the standard "
+            "min(decay, (1+n)/(10+n)) schedule. This prevents a 3k probe from "
+            "evaluating an EMA that is still dominated by initialization."
+        ),
+    )
+    ap.add_argument(
+        "--zq-channel-stats",
+        default=str(ROOT / "prepared/zq_targets_v1/channel_stats.pt"),
+    )
     ap.add_argument("--max-rows", type=int, default=0, help="Smoke-test cap; 0 means all rows")
     ap.add_argument("--smoke-small-model", action="store_true")
     return ap.parse_args()
@@ -123,8 +168,18 @@ class CFMItem:
 
 
 class DDLFMDataset(Dataset[CFMItem]):
-    def __init__(self, index_path: str | Path, *, max_rows: int = 0, max_frames: int = 0) -> None:
+    def __init__(
+        self,
+        index_path: str | Path,
+        *,
+        max_rows: int = 0,
+        max_frames: int = 0,
+        mode: str = "no_text",
+    ) -> None:
         self.max_frames = max(0, int(max_frames))
+        self.mode = str(mode)
+        if self.mode not in {"no_text", "all"}:
+            raise ValueError(f"unsupported DDLFM dataset mode: {self.mode}")
         self.items: list[CFMItem] = []
         with Path(index_path).open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -133,6 +188,8 @@ class DDLFMDataset(Dataset[CFMItem]):
                 row = json.loads(line)
                 mode_name = str(row.get("moss_codecvc_mode") or "")
                 if mode_name not in {"no_text", "text"}:
+                    continue
+                if self.mode == "no_text" and mode_name != "no_text":
                     continue
                 self.items.append(
                     CFMItem(
@@ -241,6 +298,7 @@ class DDLFMTrainModule(nn.Module):
             num_layers=layers,
             num_heads=heads,
             ffn_size=ffn,
+            cross_gate_init=float(getattr(args, "cross_gate_init", 0.0)),
         )
         self.text_encoder = SourceTokenMemoryEncoder(
             vocab_size=int(args.text_vocab_size),
@@ -281,15 +339,220 @@ class DDLFMTrainModule(nn.Module):
         return semantic, mask
 
 
-def masked_mse(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def sample_cfm_time(
+    batch_size: int,
+    *,
+    device: torch.device,
+    schedule: str,
+    logit_mu: float = 0.0,
+    logit_sigma: float = 1.0,
+) -> torch.Tensor:
+    """Sample CFM interpolation time with an auditable schedule."""
+
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive")
+    schedule = str(schedule)
+    if schedule == "uniform":
+        return torch.rand(int(batch_size), device=device)
+    if schedule == "cosine":
+        u = torch.rand(int(batch_size), device=device)
+        return 1.0 - torch.cos(0.5 * math.pi * u)
+    if schedule == "logit_normal":
+        if float(logit_sigma) <= 0.0:
+            raise ValueError("logit_sigma must be positive")
+        normal = torch.randn(int(batch_size), device=device)
+        return torch.sigmoid(float(logit_mu) + float(logit_sigma) * normal)
+    raise ValueError(f"unsupported t schedule: {schedule}")
+
+
+def cfm_loss_weights(
+    t: torch.Tensor,
+    *,
+    mode: str,
+    eps: float,
+    cap: float,
+) -> torch.Tensor:
+    """Return bounded, mean-one per-example velocity-loss weights.
+
+    The Batch-46 intent is to strengthen the real inference endpoint ``t≈0``.
+    That corresponds to ``1/(t+eps)``.  The literal ``1/(1-t+eps)`` proposal
+    instead emphasizes the target endpoint, so it remains available only as
+    the explicitly named ``high_t`` control.
+    """
+
+    if t.ndim != 1:
+        raise ValueError(f"t must be [B], got {tuple(t.shape)}")
+    if float(eps) <= 0.0:
+        raise ValueError("loss-weight eps must be positive")
+    if float(cap) < 1.0:
+        raise ValueError("loss-weight cap must be >= 1")
+    mode = str(mode)
+    if mode == "none":
+        raw = torch.ones_like(t)
+    elif mode == "low_t":
+        raw = 1.0 / (t + float(eps))
+    elif mode == "high_t":
+        raw = 1.0 / (1.0 - t + float(eps))
+    else:
+        raise ValueError(f"unsupported loss weighting: {mode}")
+    raw = raw.clamp(max=float(cap))
+    return raw / raw.detach().mean().clamp_min(1.0e-8)
+
+
+def apply_speaker_dropout(
+    speaker: torch.Tensor,
+    probability: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero whole speaker embeddings for classifier-free guidance training."""
+
+    if speaker.ndim != 2:
+        raise ValueError(f"speaker must be [B,D], got {tuple(speaker.shape)}")
+    if not 0.0 <= float(probability) <= 1.0:
+        raise ValueError("speaker dropout probability must be in [0, 1]")
+    mask = torch.rand(int(speaker.shape[0]), device=speaker.device) < float(probability)
+    if not bool(mask.any().item()):
+        return speaker, mask
+    dropped = speaker.clone()
+    dropped[mask] = 0.0
+    return dropped, mask
+
+
+def masked_mse(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
     weight = mask.unsqueeze(-1).to(dtype=prediction.dtype)
+    if sample_weight is not None:
+        if sample_weight.ndim != 1 or int(sample_weight.shape[0]) != int(prediction.shape[0]):
+            raise ValueError("sample_weight must be [B]")
+        weight = weight * sample_weight.to(device=prediction.device, dtype=prediction.dtype)[:, None, None]
     denom = weight.sum().clamp_min(1.0) * prediction.shape[-1]
     return ((prediction - target).square() * weight).sum() / denom
+
+
+class ExponentialMovingAverage:
+    """Device-local EMA of a module state, serialized with each checkpoint."""
+
+    def __init__(self, module: nn.Module, decay: float, *, warmup: bool = True) -> None:
+        if not 0.0 <= float(decay) < 1.0:
+            raise ValueError("EMA decay must be in [0, 1)")
+        self.decay = float(decay)
+        self.warmup = bool(warmup)
+        self.num_updates = 0
+        self.last_decay = 0.0
+        self.shadow = {
+            name: value.detach().clone()
+            for name, value in module.state_dict().items()
+        }
+
+    def effective_decay(self, num_updates: int | None = None) -> float:
+        updates = self.num_updates if num_updates is None else int(num_updates)
+        if updates <= 0:
+            return 0.0
+        if not self.warmup:
+            return self.decay
+        return min(self.decay, (1.0 + float(updates)) / (10.0 + float(updates)))
+
+    @torch.no_grad()
+    def update(self, module: nn.Module) -> None:
+        state = module.state_dict()
+        if state.keys() != self.shadow.keys():
+            raise RuntimeError("EMA/module state keys changed during training")
+        self.num_updates += 1
+        decay = self.effective_decay()
+        self.last_decay = float(decay)
+        for name, value in state.items():
+            target = self.shadow[name]
+            source = value.detach().to(device=target.device)
+            if torch.is_floating_point(target):
+                target.mul_(decay).add_(source.to(dtype=target.dtype), alpha=1.0 - decay)
+            else:
+                target.copy_(source)
+
+    def state_dict_cpu(self) -> dict[str, torch.Tensor]:
+        return {name: value.detach().cpu() for name, value in self.shadow.items()}
+
+
+def _gradient_l2(parameters: list[torch.Tensor]) -> float:
+    total = 0.0
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().float()
+        total += float(grad.square().sum().item())
+    return math.sqrt(total)
+
+
+def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
+    """Return rank-local, pre-clip speaker/semantic gradient norms."""
+
+    speaker_proj_parameters = [
+        parameter
+        for submodule in module.decoder.speaker_proj
+        for parameter in submodule.parameters(recurse=False)
+    ]
+    return {
+        "speaker_prompt_grad_l2_rank_local_preclip": _gradient_l2(
+            [module.decoder.speaker_prompt]
+        ),
+        "speaker_proj_grad_l2_rank_local_preclip": _gradient_l2(
+            speaker_proj_parameters
+        ),
+        "semantic_proj_grad_l2_rank_local_preclip": _gradient_l2(
+            list(module.decoder.semantic_proj.parameters())
+        ),
+    }
+
+
+def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    """Publish a checkpoint only after ``torch.save`` fully succeeds."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_json_write(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_link(source: Path, destination: Path) -> None:
+    """Atomically repoint ``destination`` at a completed same-filesystem file."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError:
+            # Some network/object-backed filesystems disable hard links.  A
+            # same-directory temporary copy preserves atomic publication.
+            shutil.copyfile(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def save_checkpoint(
     module: DDLFMTrainModule,
     optimizer: torch.optim.Optimizer,
+    ema: ExponentialMovingAverage,
     step: int,
     args: argparse.Namespace,
     output_dir: Path,
@@ -300,16 +563,53 @@ def save_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     state = module.state_dict()
     path = output_dir / f"step-{int(step):06d}.pt"
-    torch.save(
+    ema_state = ema.state_dict_cpu()
+    ema_metadata = {
+        "target_decay": ema.decay,
+        "warmup": ema.warmup,
+        "num_updates": ema.num_updates,
+        "effective_decay": ema.last_decay,
+    }
+    atomic_torch_save(
         {
             "step": int(step),
             "model": state,
+            "ema_model": ema_state,
+            "ema": ema_metadata,
             "optimizer": optimizer.state_dict(),
             "config": vars(args),
         },
         path,
     )
-    torch.save({"step": int(step), "model": state, "config": vars(args)}, output_dir / "last.pt")
+    infer_path = output_dir / f"step-{int(step):06d}.infer.pt"
+    atomic_torch_save(
+        {
+            "step": int(step),
+            "model": state,
+            "ema_model": ema_state,
+            "ema": ema_metadata,
+            "config": vars(args),
+        },
+        infer_path,
+    )
+    last_path = output_dir / "last.pt"
+    atomic_link(infer_path, last_path)
+    atomic_json_write(
+        {
+            "schema": "ver3_1_ddlfm_checkpoint_ready_v1",
+            "status": "ready",
+            "step": int(step),
+            "checkpoint": str(path),
+            "checkpoint_size_bytes": int(path.stat().st_size),
+            "inference_checkpoint": str(infer_path),
+            "inference_checkpoint_size_bytes": int(infer_path.stat().st_size),
+            "last_checkpoint": str(last_path),
+            "last_checkpoint_size_bytes": int(last_path.stat().st_size),
+            "ema": ema_metadata,
+            "created_at_unix": time.time(),
+        },
+        output_dir / f"step-{int(step):06d}.ready.json",
+    )
 
 
 def infinite_loader(loader: DataLoader):
@@ -328,10 +628,19 @@ def infinite_loader(loader: DataLoader):
 
 def main() -> int:
     args = parse_args()
+    if not 0.0 <= float(args.speaker_dropout) < 1.0:
+        raise ValueError("speaker-dropout must be in [0, 1)")
+    if not 0.0 <= float(args.gate_warmup_start) <= 1.0:
+        raise ValueError("gate-warmup-start must be in [0, 1]")
     use_dist, rank, world_size, device = init_distributed()
     seed_everything(int(args.seed), rank)
     output_dir = Path(args.output_dir).expanduser().resolve()
-    dataset = DDLFMDataset(args.index, max_rows=int(args.max_rows), max_frames=int(args.max_frames))
+    dataset = DDLFMDataset(
+        args.index,
+        max_rows=int(args.max_rows),
+        max_frames=int(args.max_frames),
+        mode=str(args.mode),
+    )
     sampler = DistributedSampler(dataset, shuffle=True, seed=int(args.seed)) if use_dist else None
     loader = DataLoader(
         dataset,
@@ -355,7 +664,27 @@ def main() -> int:
             find_unused_parameters=True,
         )
     raw_module = module.module if isinstance(module, DistributedDataParallel) else module
+    stats_path = Path(args.zq_channel_stats).expanduser().resolve()
+    if not stats_path.is_file():
+        raise FileNotFoundError(
+            f"Batch-46 requires complete zq channel stats before training: {stats_path}"
+        )
+    zq_stats = load_zq_channel_stats(stats_path)
+    if str(zq_stats.get("status")) != "completed" or bool(zq_stats.get("partial", False)):
+        raise ValueError(f"refusing incomplete zq channel stats: {stats_path}")
+    if int(zq_stats["latent_dim"]) != int(args.latent_dim):
+        raise ValueError("zq channel stats latent_dim does not match the model")
+    args.zq_channel_stats = str(stats_path)
+    args.zq_channel_stats_sha256 = sha256_file(stats_path)
+    args.zq_normalization_enabled = True
+    zq_mean = zq_stats["mean"].to(device=device, dtype=torch.float32).view(1, 1, -1)
+    zq_std = zq_stats["std"].to(device=device, dtype=torch.float32).view(1, 1, -1)
     optimizer = torch.optim.AdamW(module.parameters(), lr=float(args.lr), betas=(0.9, 0.95), weight_decay=0.01)
+    ema = ExponentialMovingAverage(
+        raw_module,
+        float(args.ema_decay),
+        warmup=bool(args.ema_warmup),
+    )
     use_amp = device.type == "cuda" and args.precision in {"bf16", "fp16"}
     amp_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and args.precision == "fp16")
@@ -370,54 +699,150 @@ def main() -> int:
         if sampler is not None and (step - 1) % max(1, len(loader)) == 0:
             sampler.set_epoch((step - 1) // max(1, len(loader)))
         warmup_scale = min(1.0, float(step) / max(1, int(args.warmup_steps)))
+        gate_progress = min(1.0, float(step) / max(1, int(args.gate_warmup_steps)))
+        gate_scale = float(args.gate_warmup_start) + (1.0 - float(args.gate_warmup_start)) * gate_progress
         current_lr = float(args.lr) * warmup_scale
         for group in optimizer.param_groups:
             group["lr"] = current_lr
         optimizer.zero_grad(set_to_none=True)
         loss_total = 0.0
+        speaker_drop_total = 0
+        t_sum = 0.0
+        t_low_total = 0
+        loss_weight_min = math.inf
+        loss_weight_max = 0.0
+        last_t: torch.Tensor | None = None
+        last_speaker_input: torch.Tensor | None = None
         for _micro_step in range(grad_accum_steps):
             batch = next(iterator)
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
-            target = batch["zq"]
-            t = torch.rand(target.shape[0], device=device)
+            target = (batch["zq"] - zq_mean) / zq_std
+            t = sample_cfm_time(
+                int(target.shape[0]),
+                device=device,
+                schedule=str(args.t_sampling),
+                logit_mu=float(args.t_logit_mu),
+                logit_sigma=float(args.t_logit_sigma),
+            )
             noise = torch.randn_like(target)
             x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * target
             v_target = target - noise
             semantic, semantic_mask = raw_module.build_semantic(batch)
+            speaker_input, speaker_drop_mask = apply_speaker_dropout(
+                batch["speaker"],
+                float(args.speaker_dropout),
+            )
+            sample_weight = cfm_loss_weights(
+                t,
+                mode=str(args.loss_weighting),
+                eps=float(args.loss_weight_eps),
+                cap=float(args.loss_weight_cap),
+            )
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 prediction = module(
                     x_t,
                     t,
                     semantic,
-                    batch["speaker"],
+                    speaker_input,
                     target_mask=batch["target_mask"],
                     semantic_mask=semantic_mask,
                     semantic_modality=batch["mode"],
+                    condition_gate_scale=gate_scale,
                 ).velocity
-                loss = masked_mse(prediction, v_target, batch["target_mask"])
+                loss = masked_mse(
+                    prediction,
+                    v_target,
+                    batch["target_mask"],
+                    sample_weight=sample_weight,
+                )
                 scaled_loss = loss / float(grad_accum_steps)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite CFM loss at step {step}: {loss}")
             loss_total += float(loss.detach().cpu().item())
+            speaker_drop_total += int(speaker_drop_mask.sum().item())
+            t_sum += float(t.detach().sum().item())
+            t_low_total += int((t < 0.2).sum().item())
+            loss_weight_min = min(loss_weight_min, float(sample_weight.detach().min().item()))
+            loss_weight_max = max(loss_weight_max, float(sample_weight.detach().max().item()))
+            last_t = t.detach()
+            last_speaker_input = speaker_input.detach()
             scaler.scale(scaled_loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
+        should_log = step == 1 or step % max(1, int(args.log_every)) == 0
+        should_diagnose = step == 1 or step % 500 == 0
+        grad_diagnostics = (
+            speaker_gradient_diagnostics(raw_module)
+            if rank == 0 and (should_log or should_diagnose)
+            else {}
+        )
+        total_grad_norm = float(torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0).item())
         scaler.step(optimizer)
         scaler.update()
-        if rank == 0 and (step == 1 or step % max(1, int(args.log_every)) == 0):
+        ema.update(raw_module)
+        local_examples = int(args.batch_size) * grad_accum_steps
+        if should_log:
+            reduced = torch.tensor(
+                [loss_total, t_sum, float(t_low_total), float(speaker_drop_total), float(local_examples)],
+                dtype=torch.float64,
+                device=device,
+            )
+            reduced_min = torch.tensor(loss_weight_min, dtype=torch.float64, device=device)
+            reduced_max = torch.tensor(loss_weight_max, dtype=torch.float64, device=device)
+            if use_dist:
+                dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+                dist.all_reduce(reduced_min, op=dist.ReduceOp.MIN)
+                dist.all_reduce(reduced_max, op=dist.ReduceOp.MAX)
+            global_examples = max(1.0, float(reduced[4].item()))
+            global_loss = float(reduced[0].item()) / float(max(1, world_size) * grad_accum_steps)
+        if rank == 0 and should_log:
             payload = {
                 "step": step,
-                "loss": loss_total / float(grad_accum_steps),
+                "loss": global_loss,
+                "loss_reduction": "mean_over_ddp_ranks_and_microbatches",
                 "lr": current_lr,
+                "gate_scale": gate_scale,
+                "t_mean": float(reduced[1].item()) / global_examples,
+                "t_lt_0_2_ratio": float(reduced[2].item()) / global_examples,
+                "loss_weight_min": float(reduced_min.item()),
+                "loss_weight_max": float(reduced_max.item()),
+                "speaker_dropout_ratio": float(reduced[3].item()) / global_examples,
+                "ema_target_decay": float(ema.decay),
+                "ema_effective_decay": float(ema.last_decay),
+                "ema_num_updates": int(ema.num_updates),
+                "total_grad_norm_rank0_preclip": total_grad_norm,
                 "elapsed_sec": time.time() - started,
                 "world_size": world_size,
                 "rows": len(dataset),
+                "mode": str(args.mode),
             }
+            payload.update(grad_diagnostics)
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload) + "\n")
             print(json.dumps(payload), flush=True)
+        if rank == 0 and should_diagnose:
+            if last_t is None or last_speaker_input is None:
+                raise RuntimeError("conditioning diagnostics have no sampled batch")
+            diagnostics = raw_module.decoder.conditioning_diagnostics(
+                last_t,
+                last_speaker_input,
+                gate_scale=gate_scale,
+            )
+            diagnostics.update(
+                {
+                    "step": int(step),
+                    "gate_warmup_steps": int(args.gate_warmup_steps),
+                    "cross_gate_init": float(args.cross_gate_init),
+                    "gradient_norms": grad_diagnostics,
+                    "total_grad_norm_rank0_preclip": total_grad_norm,
+                }
+            )
+            diagnostic_path = output_dir / f"adaln_diagnostics_step-{int(step):06d}.json"
+            diagnostic_path.write_text(
+                json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         if step % max(1, int(args.save_every)) == 0 or step == int(args.steps):
-            save_checkpoint(raw_module, optimizer, step, args, output_dir, rank)
+            save_checkpoint(raw_module, optimizer, ema, step, args, output_dir, rank)
     if use_dist:
         dist.barrier()
         dist.destroy_process_group()

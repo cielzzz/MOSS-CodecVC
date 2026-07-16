@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -24,10 +25,29 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from moss_codecvc.audio import decode_latents
+from moss_codecvc.audio import (
+    decode_latents,
+    denormalize_zq,
+    load_zq_channel_stats,
+    sha256_file,
+)
 from moss_codecvc.moss_codec import MossCodec
 from moss_codecvc.models.source_semantic_memory import SourceTokenMemoryEncoder
 from scripts.ver3_1.train_ddlfm_cfm import DDLFMTrainModule, load_embedding
+
+
+def combine_cfg_velocity(
+    velocity_cond: torch.Tensor,
+    velocity_uncond: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Combine conditional and zero-speaker velocities for speaker CFG."""
+
+    if velocity_cond.shape != velocity_uncond.shape:
+        raise ValueError("conditional and unconditional velocity shapes must match")
+    if not math.isfinite(float(scale)) or float(scale) < 0.0:
+        raise ValueError("cfg_scale must be finite and non-negative")
+    return velocity_uncond + float(scale) * (velocity_cond - velocity_uncond)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +64,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--speaker-embedding", required=True)
     ap.add_argument("--target-frames", type=int, default=0)
     ap.add_argument("--sampling-steps", type=int, default=20)
+    ap.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=None,
+        help="Default: 1.5 for CFG-trained checkpoints, otherwise 1.0 for legacy checkpoints.",
+    )
+    ap.add_argument(
+        "--zq-channel-stats",
+        default="",
+        help="Override channel_stats.pt; default comes from the checkpoint config.",
+    )
+    ap.add_argument(
+        "--no-ema",
+        action="store_true",
+        help="Use raw training weights instead of the Batch-46 EMA weights.",
+    )
     ap.add_argument("--seed", type=int, default=20260715)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--codec-path", default="")
@@ -68,7 +104,12 @@ def encode_text(text: str, tokenizer_model: str) -> torch.Tensor:
     return torch.as_tensor([int(x) + 1 for x in ids], dtype=torch.long)
 
 
-def load_checkpoint(path: Path, device: torch.device) -> tuple[DDLFMTrainModule, dict[str, Any]]:
+def load_checkpoint(
+    path: Path,
+    device: torch.device,
+    *,
+    use_ema: bool = True,
+) -> tuple[DDLFMTrainModule, dict[str, Any]]:
     payload = torch.load(str(path), map_location="cpu", weights_only=False)
     cfg = dict(payload.get("config") or {})
     args = SimpleNamespace(
@@ -79,12 +120,20 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[DDLFMTrainModule,
         num_layers=int(cfg.get("num_layers", 12)),
         num_heads=int(cfg.get("num_heads", 12)),
         ffn_size=int(cfg.get("ffn_size", 3072)),
+        cross_gate_init=float(cfg.get("cross_gate_init", 0.0)),
         text_vocab_size=int(cfg.get("text_vocab_size", 8001)),
         text_padding_id=int(cfg.get("text_padding_id", 0)),
         smoke_small_model=bool(cfg.get("smoke_small_model", False)),
     )
     module = DDLFMTrainModule(args).to(device).eval()
-    module.load_state_dict(payload["model"], strict=True)
+    state = payload.get("ema_model") if use_ema else None
+    using_ema = state is not None
+    if state is None:
+        state = payload["model"]
+    module.load_state_dict(state, strict=True)
+    cfg["_checkpoint_has_ema"] = payload.get("ema_model") is not None
+    cfg["_checkpoint_using_ema"] = bool(using_ema)
+    cfg["_checkpoint_ema_metadata"] = dict(payload.get("ema") or {})
     return module, cfg
 
 
@@ -98,6 +147,7 @@ def sample_velocity(
     speaker: torch.Tensor,
     modality: int,
     steps: int,
+    cfg_scale: float,
     device: torch.device,
     seed: int,
 ) -> torch.Tensor:
@@ -111,10 +161,13 @@ def sample_velocity(
     semantic = semantic.to(device=device)
     semantic_mask = semantic_mask.to(device=device)
     speaker = speaker.to(device=device)
+    if not math.isfinite(float(cfg_scale)) or float(cfg_scale) < 0.0:
+        raise ValueError("cfg_scale must be finite and non-negative")
+    zero_speaker = torch.zeros_like(speaker)
     for index in range(int(steps)):
         t_value = float(index) / float(steps)
         t = torch.full((1,), t_value, device=device)
-        velocity = module.decoder(
+        velocity_cond = module.decoder(
             x,
             t,
             semantic,
@@ -123,6 +176,19 @@ def sample_velocity(
             semantic_mask=semantic_mask,
             semantic_modality=torch.tensor([int(modality)], device=device),
         ).velocity
+        if float(cfg_scale) == 1.0:
+            velocity = velocity_cond
+        else:
+            velocity_uncond = module.decoder(
+                x,
+                t,
+                semantic,
+                zero_speaker,
+                target_mask=target_mask,
+                semantic_mask=semantic_mask,
+                semantic_modality=torch.tensor([int(modality)], device=device),
+            ).velocity
+            velocity = combine_cfg_velocity(velocity_cond, velocity_uncond, float(cfg_scale))
         x = x + velocity / float(steps)
     return x
 
@@ -130,7 +196,18 @@ def sample_velocity(
 def main() -> int:
     args = parse_args()
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
-    module, cfg = load_checkpoint(Path(args.checkpoint).expanduser().resolve(), device)
+    module, cfg = load_checkpoint(
+        Path(args.checkpoint).expanduser().resolve(),
+        device,
+        use_ema=not bool(args.no_ema),
+    )
+    cfg_scale = (
+        float(args.cfg_scale)
+        if args.cfg_scale is not None
+        else (1.5 if float(cfg.get("speaker_dropout", 0.0)) > 0.0 else 1.0)
+    )
+    using_ema = bool(cfg.get("_checkpoint_using_ema", False))
+    normalization_enabled = bool(cfg.get("zq_normalization_enabled", False))
     if args.mode == "no_text":
         if not args.semantic_path:
             raise ValueError("--semantic-path is required for no_text")
@@ -159,6 +236,9 @@ def main() -> int:
             "semantic_shape": list(semantic.shape),
             "speaker_shape": list(speaker.shape),
             "parameters": module.decoder.parameter_count(),
+            "cfg_scale": cfg_scale,
+            "using_ema": using_ema,
+            "zq_normalization_enabled": normalization_enabled,
         }, ensure_ascii=False))
         return 0
     z_pred = sample_velocity(
@@ -169,9 +249,27 @@ def main() -> int:
         speaker=speaker,
         modality=0 if args.mode == "no_text" else 1,
         steps=int(args.sampling_steps),
+        cfg_scale=cfg_scale,
         device=device,
         seed=int(args.seed),
     )
+    stats_path: Path | None = None
+    actual_stats_sha = ""
+    if normalization_enabled:
+        stats_value = args.zq_channel_stats or str(cfg.get("zq_channel_stats") or "")
+        if not stats_value:
+            raise ValueError("normalized DDLFM inference requires zq channel stats")
+        stats_path = Path(stats_value).expanduser().resolve()
+        expected_stats_sha = str(cfg.get("zq_channel_stats_sha256") or "")
+        actual_stats_sha = sha256_file(stats_path)
+        if expected_stats_sha and actual_stats_sha != expected_stats_sha:
+            raise ValueError(
+                f"zq channel stats SHA256 mismatch: {actual_stats_sha} != {expected_stats_sha}"
+            )
+        stats = load_zq_channel_stats(stats_path)
+        if str(stats.get("status")) != "completed" or bool(stats.get("partial", False)):
+            raise ValueError(f"refusing incomplete zq channel stats: {stats_path}")
+        z_pred = denormalize_zq(z_pred, stats, channel_dim=-1)
     if not args.codec_path:
         raise ValueError("--codec-path is required unless --dry-run is used")
     codec = MossCodec(
@@ -196,6 +294,11 @@ def main() -> int:
         "sample_rate": int(codec.sample_rate),
         "target_frames": target_frames,
         "sampling_steps": int(args.sampling_steps),
+        "cfg_scale": cfg_scale,
+        "using_ema": using_ema,
+        "zq_normalization_enabled": normalization_enabled,
+        "zq_channel_stats": str(stats_path) if stats_path is not None else None,
+        "zq_channel_stats_sha256": actual_stats_sha or None,
     }, ensure_ascii=False))
     return 0
 

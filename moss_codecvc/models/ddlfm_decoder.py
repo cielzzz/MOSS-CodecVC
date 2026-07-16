@@ -22,6 +22,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -45,6 +46,59 @@ def _modulate(normed: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) ->
     return normed * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+def _apply_rotary_position_embedding(
+    value: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    base: float,
+) -> torch.Tensor:
+    """Apply parameter-free RoPE to ``[B,H,L,D]`` attention projections.
+
+    ``positions`` may be the shared ``[L]`` position vector or a per-row
+    ``[B,L]`` matrix.  RoPE is evaluated in float32 for numerical stability
+    and cast back to the attention dtype.  If the head dimension is odd, the
+    largest even prefix is rotated and the final channel is left unchanged.
+    """
+
+    if value.ndim != 4:
+        raise ValueError(f"RoPE value must be [B,H,L,D], got {tuple(value.shape)}")
+    batch, _heads, length, head_dim = value.shape
+    rotary_dim = int(head_dim) - int(head_dim) % 2
+    if rotary_dim == 0 or length == 0:
+        return value
+    positions = positions.to(device=value.device)
+    if positions.ndim == 1:
+        if int(positions.shape[0]) != int(length):
+            raise ValueError(
+                f"RoPE positions length {int(positions.shape[0])} does not match value length {length}"
+            )
+        positions = positions.unsqueeze(0).expand(batch, -1)
+    elif positions.ndim == 2:
+        if tuple(positions.shape) != (batch, length):
+            raise ValueError(
+                f"RoPE positions shape {tuple(positions.shape)} does not match {(batch, length)}"
+            )
+    else:
+        raise ValueError(f"RoPE positions must be [L] or [B,L], got {tuple(positions.shape)}")
+
+    inv_freq = torch.exp(
+        -math.log(float(base))
+        * torch.arange(0, rotary_dim, 2, device=value.device, dtype=torch.float32)
+        / float(rotary_dim)
+    )
+    phase = positions.to(dtype=torch.float32).unsqueeze(-1) * inv_freq.view(1, 1, -1)
+    cos = torch.repeat_interleave(phase.cos(), 2, dim=-1).unsqueeze(1).to(dtype=value.dtype)
+    sin = torch.repeat_interleave(phase.sin(), 2, dim=-1).unsqueeze(1).to(dtype=value.dtype)
+
+    rotated = value[..., :rotary_dim]
+    even, odd = rotated[..., 0::2], rotated[..., 1::2]
+    rotate_half = torch.stack((-odd, even), dim=-1).flatten(-2)
+    rotated = rotated * cos + rotate_half * sin
+    if rotary_dim == head_dim:
+        return rotated
+    return torch.cat([rotated, value[..., rotary_dim:]], dim=-1)
+
+
 class DDLFMAdaLNBlock(nn.Module):
     """Self-attention + semantic cross-attention + FFN with AdaLN gates."""
 
@@ -55,6 +109,8 @@ class DDLFMAdaLNBlock(nn.Module):
         ffn_size: int,
         condition_size: int,
         dropout: float = 0.0,
+        rope_base: float = 10000.0,
+        cross_gate_init: float = 0.0,
     ) -> None:
         super().__init__()
         hidden_size = int(hidden_size)
@@ -62,6 +118,14 @@ class DDLFMAdaLNBlock(nn.Module):
         if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads != 0:
             raise ValueError("hidden_size must be positive and divisible by num_heads")
         self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.rope_base = float(rope_base)
+        if not math.isfinite(self.rope_base) or self.rope_base <= 1.0:
+            raise ValueError("rope_base must be finite and greater than 1")
+        self.cross_gate_init = float(cross_gate_init)
+        if not math.isfinite(self.cross_gate_init):
+            raise ValueError("cross_gate_init must be finite")
         self.norm_self = nn.LayerNorm(hidden_size, elementwise_affine=False)
         self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False)
         self.norm_ffn = nn.LayerNorm(hidden_size, elementwise_affine=False)
@@ -82,10 +146,72 @@ class DDLFMAdaLNBlock(nn.Module):
             nn.LayerNorm(int(condition_size)),
             nn.Linear(int(condition_size), hidden_size * 9),
         )
-        # AdaLN-Zero-style start: the residual branches begin as identity and
-        # learn their conditioning gates from a stable zero-velocity head.
+        # AdaLN-Zero-style start.  Self-attention and FFN begin as identity;
+        # the semantic cross branch may use a small explicit nonzero gate.
         nn.init.zeros_(self.condition[-1].weight)
         nn.init.zeros_(self.condition[-1].bias)
+        with torch.no_grad():
+            self.condition[-1].bias[5 * hidden_size : 6 * hidden_size].fill_(
+                self.cross_gate_init
+            )
+
+    def _cross_attention_with_rope(
+        self,
+        query: torch.Tensor,
+        semantic: torch.Tensor,
+        *,
+        semantic_mask: torch.Tensor,
+        target_positions: torch.Tensor,
+        semantic_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run cross-attention with RoPE on projected target Q and semantic K.
+
+        The projections and output layer remain the original
+        :class:`~torch.nn.MultiheadAttention` parameters.  This keeps state
+        dict compatibility while making the semantic memory explicitly
+        order-sensitive.
+        """
+
+        batch, target_len, hidden = query.shape
+        if semantic.ndim != 3 or int(semantic.shape[0]) != batch or int(semantic.shape[2]) != hidden:
+            raise ValueError(
+                f"semantic must be [B,S,{hidden}] for cross-attention, got {tuple(semantic.shape)}"
+            )
+        semantic_len = int(semantic.shape[1])
+        if tuple(semantic_mask.shape) != (batch, semantic_len):
+            raise ValueError(
+                f"semantic_mask shape {tuple(semantic_mask.shape)} does not match semantic"
+            )
+
+        q_weight, k_weight, v_weight = self.cross_attn.in_proj_weight.chunk(3, dim=0)
+        if self.cross_attn.in_proj_bias is None:
+            q_bias = k_bias = v_bias = None
+        else:
+            q_bias, k_bias, v_bias = self.cross_attn.in_proj_bias.chunk(3, dim=0)
+        q = F.linear(query, q_weight, q_bias)
+        k = F.linear(semantic, k_weight, k_bias)
+        v = F.linear(semantic, v_weight, v_bias)
+
+        q = q.view(batch, target_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, semantic_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, semantic_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = _apply_rotary_position_embedding(q, target_positions, base=self.rope_base)
+        k = _apply_rotary_position_embedding(k, semantic_positions, base=self.rope_base)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(self.head_dim))
+        valid_keys = semantic_mask[:, None, None, :]
+        scores = scores.masked_fill(~valid_keys, torch.finfo(scores.dtype).min)
+        attention = torch.softmax(scores, dim=-1)
+        attention = attention.masked_fill(~valid_keys, 0.0)
+        if float(self.cross_attn.dropout) > 0.0:
+            attention = F.dropout(
+                attention,
+                p=float(self.cross_attn.dropout),
+                training=self.training,
+            )
+        output = torch.matmul(attention, v)
+        output = output.transpose(1, 2).contiguous().view(batch, target_len, hidden)
+        return self.cross_attn.out_proj(output)
 
     def forward(
         self,
@@ -95,11 +221,18 @@ class DDLFMAdaLNBlock(nn.Module):
         target_mask: torch.Tensor,
         semantic: torch.Tensor,
         semantic_mask: torch.Tensor,
+        target_positions: torch.Tensor | None = None,
+        semantic_positions: torch.Tensor | None = None,
+        condition_gate_scale: float = 1.0,
     ) -> torch.Tensor:
         params = self.condition(condition).chunk(9, dim=-1)
         shift_self, scale_self, gate_self = params[0:3]
         shift_cross, scale_cross, gate_cross = params[3:6]
         shift_ffn, scale_ffn, gate_ffn = params[6:9]
+        gate_scale = float(condition_gate_scale)
+        if not math.isfinite(gate_scale) or gate_scale < 0.0:
+            raise ValueError("condition_gate_scale must be finite and non-negative")
+        gate_cross = gate_cross * gate_scale
 
         h = _modulate(self.norm_self(x), shift_self, scale_self)
         h = self.self_attn(
@@ -112,13 +245,17 @@ class DDLFMAdaLNBlock(nn.Module):
         x = x + gate_self.unsqueeze(1) * h
 
         h = _modulate(self.norm_cross(x), shift_cross, scale_cross)
-        h = self.cross_attn(
+        if target_positions is None:
+            target_positions = torch.arange(x.shape[1], device=x.device)
+        if semantic_positions is None:
+            semantic_positions = torch.arange(semantic.shape[1], device=semantic.device)
+        h = self._cross_attention_with_rope(
             h,
             semantic,
-            semantic,
-            key_padding_mask=~semantic_mask,
-            need_weights=False,
-        )[0]
+            semantic_mask=semantic_mask,
+            target_positions=target_positions,
+            semantic_positions=semantic_positions,
+        )
         x = x + gate_cross.unsqueeze(1) * h
 
         h = _modulate(self.norm_ffn(x), shift_ffn, scale_ffn)
@@ -146,6 +283,8 @@ class DDLFMDecoder(nn.Module):
         ffn_size: int = 3072,
         dropout: float = 0.0,
         num_modalities: int = 2,
+        rope_base: float = 10000.0,
+        cross_gate_init: float = 0.0,
     ) -> None:
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -183,6 +322,8 @@ class DDLFMDecoder(nn.Module):
                     int(ffn_size),
                     self.hidden_size,
                     dropout=float(dropout),
+                    rope_base=float(rope_base),
+                    cross_gate_init=float(cross_gate_init),
                 )
                 for _ in range(int(num_layers))
             ]
@@ -195,6 +336,86 @@ class DDLFMDecoder(nn.Module):
             if (p.requires_grad or not trainable_only)
         )
 
+    @torch.no_grad()
+    def conditioning_diagnostics(
+        self,
+        t: torch.Tensor,
+        speaker: torch.Tensor,
+        gate_scale: float = 1.0,
+    ) -> dict[str, object]:
+        """Return JSON-safe AdaLN modulation statistics without side effects.
+
+        ``scale`` is the raw AdaLN output used by :func:`_modulate`; the
+        actual multiplicative factor is explicitly reported as ``1 + scale``.
+        Cross-gate statistics include ``gate_scale`` because that is the
+        effective semantic/speaker residual multiplier used by
+        :meth:`forward` during conditioning warmup.  Self/FFN gates are not
+        scaled by this control.
+        """
+
+        if t.ndim != 1:
+            raise ValueError(f"t must be [B], got {tuple(t.shape)}")
+        batch = int(t.shape[0])
+        if speaker.ndim != 2 or tuple(speaker.shape) != (batch, self.speaker_dim):
+            raise ValueError(f"speaker must be [B,{self.speaker_dim}], got {tuple(speaker.shape)}")
+        gate_scale = float(gate_scale)
+        if not math.isfinite(gate_scale) or gate_scale < 0.0:
+            raise ValueError("gate_scale must be finite and non-negative")
+
+        device = self.input_proj.weight.device
+        dtype = self.input_proj.weight.dtype
+        position = _sinusoidal_time_embedding(t.to(device=device), self.hidden_size).to(dtype=dtype)
+        time_condition = self.time_proj(position)
+        speaker_condition = self.speaker_proj(speaker.to(device=device, dtype=dtype))
+        condition = time_condition + speaker_condition
+        layer_rows: list[dict[str, object]] = []
+        for layer_index, layer in enumerate(self.layers):
+            params = layer.condition(condition).chunk(9, dim=-1)
+            row: dict[str, object] = {"layer": int(layer_index)}
+            for branch_index, branch_name in enumerate(("self", "cross", "ffn")):
+                shift, scale, gate = params[branch_index * 3 : branch_index * 3 + 3]
+                if branch_name == "cross":
+                    gate = gate * gate_scale
+                multiplier = 1.0 + scale
+                row[branch_name] = {
+                    "shift_mean_abs": float(shift.float().abs().mean().item()),
+                    "shift_max_abs": float(shift.float().abs().max().item()),
+                    "shift_p95_abs": float(torch.quantile(shift.float().abs(), 0.95).item()),
+                    "scale_mean_abs": float(scale.float().abs().mean().item()),
+                    "scale_max_abs": float(scale.float().abs().max().item()),
+                    "multiplicative_scale_formula": "1 + scale",
+                    "multiplicative_scale_mean": float(multiplier.float().mean().item()),
+                    "multiplicative_scale_min": float(multiplier.float().min().item()),
+                    "multiplicative_scale_max": float(multiplier.float().max().item()),
+                    "multiplicative_scale_p01": float(torch.quantile(multiplier.float(), 0.01).item()),
+                    "multiplicative_scale_p99": float(torch.quantile(multiplier.float(), 0.99).item()),
+                    "multiplicative_scale_negative_fraction": float(
+                        (multiplier.float() < 0.0).float().mean().item()
+                    ),
+                    "gate_mean_abs": float(gate.float().abs().mean().item()),
+                    "gate_max_abs": float(gate.float().abs().max().item()),
+                    "gate_p95_abs": float(torch.quantile(gate.float().abs(), 0.95).item()),
+                }
+            layer_rows.append(row)
+        return {
+            "gate_scale": gate_scale,
+            "gate_scale_applies_to": "cross",
+            "modulate_multiplicative_scale_formula": "1 + scale",
+            "time_condition_norm_mean": float(
+                time_condition.float().norm(dim=-1).mean().item()
+            ),
+            "speaker_condition_norm_mean": float(
+                speaker_condition.float().norm(dim=-1).mean().item()
+            ),
+            "speaker_to_time_condition_norm_ratio": float(
+                (
+                    speaker_condition.float().norm(dim=-1)
+                    / time_condition.float().norm(dim=-1).clamp_min(1.0e-8)
+                ).mean().item()
+            ),
+            "layers": layer_rows,
+        }
+
     def forward(
         self,
         x_t: torch.Tensor,
@@ -205,6 +426,7 @@ class DDLFMDecoder(nn.Module):
         target_mask: torch.Tensor | None = None,
         semantic_mask: torch.Tensor | None = None,
         semantic_modality: torch.Tensor | None = None,
+        condition_gate_scale: float = 1.0,
     ) -> DDLFMOutput:
         if x_t.ndim != 3 or int(x_t.shape[-1]) != self.latent_dim:
             raise ValueError(f"x_t must be [B,T,{self.latent_dim}], got {tuple(x_t.shape)}")
@@ -253,10 +475,15 @@ class DDLFMDecoder(nn.Module):
         semantic = semantic + self.modality_embedding(semantic_modality).unsqueeze(1).to(dtype=x.dtype)
         semantic = self.semantic_proj(semantic).masked_fill(~semantic_mask.unsqueeze(-1), 0.0)
         speaker_token = self.speaker_proj(speaker.to(dtype=x.dtype)).unsqueeze(1) + self.speaker_prompt.to(dtype=x.dtype)
-        semantic = torch.cat([semantic, speaker_token], dim=1)
+        # Keep the speaker prompt at the fixed position zero, independent of
+        # semantic duration and batch padding.  Semantic frames occupy
+        # positions 1..S, so a short row is invariant to longer batch peers.
+        semantic = torch.cat([speaker_token, semantic], dim=1)
         semantic_mask = torch.cat(
-            [semantic_mask, torch.ones(batch, 1, dtype=torch.bool, device=x.device)], dim=1
+            [torch.ones(batch, 1, dtype=torch.bool, device=x.device), semantic_mask], dim=1
         )
+        target_positions = torch.arange(target_len, device=x.device)
+        semantic_positions = torch.arange(semantic_len + 1, device=x.device)
         for layer in self.layers:
             x = layer(
                 x,
@@ -264,6 +491,9 @@ class DDLFMDecoder(nn.Module):
                 target_mask=target_mask,
                 semantic=semantic,
                 semantic_mask=semantic_mask,
+                target_positions=target_positions,
+                semantic_positions=semantic_positions,
+                condition_gate_scale=condition_gate_scale,
             )
         velocity = self.output_proj(self.output_norm(x)).masked_fill(~target_mask.unsqueeze(-1), 0.0)
         return DDLFMOutput(velocity=velocity)

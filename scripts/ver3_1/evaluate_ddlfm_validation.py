@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -47,7 +48,12 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from moss_codecvc.audio import decode_latents
+from moss_codecvc.audio import (
+    decode_latents,
+    denormalize_zq,
+    load_zq_channel_stats,
+    sha256_file,
+)
 from moss_codecvc.moss_codec import MossCodec
 from moss_codecvc.third_party import add_download_python_deps, default_speechbrain_ecapa_dir
 from scripts.ver3_1.extract_semantic_v3_1 import (
@@ -55,7 +61,7 @@ from scripts.ver3_1.extract_semantic_v3_1 import (
     load_adapter,
     load_wavlm,
 )
-from scripts.ver3_1.infer_ddlfm_cfm import encode_text, load_checkpoint
+from scripts.ver3_1.infer_ddlfm_cfm import combine_cfg_velocity, encode_text, load_checkpoint
 
 
 DEFAULT_VALIDATION = ROOT / "testset/validation/seedtts_vc_ver2_3_validation.jsonl"
@@ -80,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
     ap.add_argument("--adapter-checkpoint", default=str(DEFAULT_ADAPTER))
     ap.add_argument("--output-dir", required=True)
-    ap.add_argument("--mode", choices=("all", "no_text", "text"), default="all")
+    ap.add_argument("--mode", choices=("all", "no_text", "text"), default="no_text")
     ap.add_argument("--max-cases", type=int, default=0)
     ap.add_argument("--per-mode", type=int, default=0)
     ap.add_argument("--case-id", action="append", default=[])
@@ -88,6 +94,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--shard-index", type=int, default=0)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--sampling-steps", type=int, default=20)
+    ap.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=None,
+        help="Default: 1.5 for CFG-trained checkpoints, otherwise 1.0.",
+    )
+    ap.add_argument("--no-ema", action="store_true")
+    ap.add_argument(
+        "--zq-channel-stats",
+        default="",
+        help="Override channel_stats.pt; default comes from the checkpoint config.",
+    )
     ap.add_argument("--seed", type=int, default=20260715)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--codec-path", default=str(DEFAULT_CODEC))
@@ -302,8 +320,37 @@ class ResourceBundle:
     ) -> None:
         self.args = args
         self.device = torch.device(args.device if torch.cuda.is_available() or not str(args.device).startswith("cuda") else "cpu")
-        self.module, self.cfg = load_checkpoint(Path(args.checkpoint).expanduser().resolve(), self.device)
+        self.module, self.cfg = load_checkpoint(
+            Path(args.checkpoint).expanduser().resolve(),
+            self.device,
+            use_ema=not bool(args.no_ema),
+        )
         self.module.eval()
+        self.using_ema = bool(self.cfg.get("_checkpoint_using_ema", False))
+        self.zq_normalization_enabled = bool(self.cfg.get("zq_normalization_enabled", False))
+        self.cfg_scale = (
+            float(args.cfg_scale)
+            if args.cfg_scale is not None
+            else (1.5 if float(self.cfg.get("speaker_dropout", 0.0)) > 0.0 else 1.0)
+        )
+        self.zq_stats_path: Path | None = None
+        self.zq_stats_sha256 = ""
+        self.zq_stats: dict[str, Any] | None = None
+        if self.zq_normalization_enabled:
+            stats_value = args.zq_channel_stats or str(self.cfg.get("zq_channel_stats") or "")
+            if not stats_value:
+                raise ValueError("normalized DDLFM evaluation requires zq channel stats")
+            self.zq_stats_path = Path(stats_value).expanduser().resolve()
+            self.zq_stats_sha256 = sha256_file(self.zq_stats_path)
+            expected_stats_sha = str(self.cfg.get("zq_channel_stats_sha256") or "")
+            if expected_stats_sha and self.zq_stats_sha256 != expected_stats_sha:
+                raise ValueError(
+                    "zq channel stats SHA256 mismatch: "
+                    f"{self.zq_stats_sha256} != {expected_stats_sha}"
+                )
+            self.zq_stats = load_zq_channel_stats(self.zq_stats_path)
+            if str(self.zq_stats.get("status")) != "completed" or bool(self.zq_stats.get("partial", False)):
+                raise ValueError(f"refusing incomplete zq channel stats: {self.zq_stats_path}")
         self.codec = MossCodec(
             args.codec_path,
             moss_root=args.moss_root or None,
@@ -392,6 +439,7 @@ def sample_velocity_batch(
     speakers: torch.Tensor,
     modalities: list[int],
     steps: int,
+    cfg_scale: float,
     device: torch.device,
     seeds: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -414,10 +462,13 @@ def sample_velocity_batch(
         semantic[i, : value.shape[0]] = value.to(device=device, dtype=torch.float32)
         semantic_mask[i, : value.shape[0]] = True
     speaker = speakers.to(device=device, dtype=torch.float32)
+    if not math.isfinite(float(cfg_scale)) or float(cfg_scale) < 0.0:
+        raise ValueError("cfg_scale must be finite and non-negative")
+    zero_speaker = torch.zeros_like(speaker)
     modality = torch.as_tensor(modalities, dtype=torch.long, device=device)
     for index in range(int(steps)):
         t = torch.full((batch,), float(index) / float(steps), device=device)
-        velocity = module.decoder(
+        velocity_cond = module.decoder(
             x,
             t,
             semantic,
@@ -426,6 +477,19 @@ def sample_velocity_batch(
             semantic_mask=semantic_mask,
             semantic_modality=modality,
         ).velocity
+        if float(cfg_scale) == 1.0:
+            velocity = velocity_cond
+        else:
+            velocity_uncond = module.decoder(
+                x,
+                t,
+                semantic,
+                zero_speaker,
+                target_mask=target_mask,
+                semantic_mask=semantic_mask,
+                semantic_modality=modality,
+            ).velocity
+            velocity = combine_cfg_velocity(velocity_cond, velocity_uncond, float(cfg_scale))
         x = x + velocity / float(steps)
     return x, torch.as_tensor(target_lengths, dtype=torch.long, device=device)
 
@@ -456,9 +520,14 @@ def write_wavs(bundle: ResourceBundle, prepared: list[Prepared], output_dir: Pat
                 torch.stack([item.speaker for item in todo_group]),
                 [0 if item.mode == "no_text" else 1 for item in todo_group],
                 int(args.sampling_steps),
+                float(bundle.cfg_scale),
                 bundle.device,
                 [case_seed(int(args.seed), str(item.row.get("case_id") or "")) for item in todo_group],
             )
+            if bundle.zq_normalization_enabled:
+                if bundle.zq_stats is None:
+                    raise RuntimeError("normalization is enabled but zq stats are unavailable")
+                z_pred = denormalize_zq(z_pred, bundle.zq_stats, channel_dim=-1)
             latent_lengths = lengths.to(device=bundle.device)
             waveform, waveform_lengths = decode_latents(
                 bundle.codec.model,
@@ -485,6 +554,11 @@ def write_wavs(bundle: ResourceBundle, prepared: list[Prepared], output_dir: Pat
                 "output_wav": str(path),
                 "target_frames": int(item.target_frames),
                 "sampling_steps": int(args.sampling_steps),
+                "cfg_scale": float(bundle.cfg_scale),
+                "using_ema": bundle.using_ema,
+                "zq_normalization_enabled": bundle.zq_normalization_enabled,
+                "zq_channel_stats": str(bundle.zq_stats_path) if bundle.zq_stats_path is not None else None,
+                "zq_channel_stats_sha256": bundle.zq_stats_sha256 or None,
                 "seed": int(args.seed),
                 "case_seed": case_seed(int(args.seed), str(item.row.get("case_id") or "")),
                 "speaker_embedding_backend": "speechbrain_ecapa_192d_sidecar",
@@ -585,6 +659,11 @@ def main() -> int:
         "rows": len(output_rows),
         "by_mode": {mode: sum(str(r.get("mode")) == mode for r in output_rows) for mode in ("no_text", "text")},
         "sampling_steps": int(args.sampling_steps),
+        "cfg_scale": float(bundle.cfg_scale),
+        "using_ema": bundle.using_ema,
+        "zq_normalization_enabled": bundle.zq_normalization_enabled,
+        "zq_channel_stats": str(bundle.zq_stats_path) if bundle.zq_stats_path is not None else None,
+        "zq_channel_stats_sha256": bundle.zq_stats_sha256 or None,
         "seed": int(args.seed),
         "target_frame_rate_hz": 12.5,
         "speaker_backend": "speechbrain_ecapa_192d",
