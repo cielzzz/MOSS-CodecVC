@@ -59,16 +59,20 @@ def test_semantic_dropout_masks_complete_rows() -> None:
     assert not bool(dropped_mask.any())
 
 
-def test_dual_cfg_scale_one_is_fully_conditioned_identity() -> None:
-    cond = torch.randn(2, 4, 6)
-    speaker = torch.randn_like(cond)
-    semantic = torch.randn_like(cond)
+def test_dual_cfg_uses_standard_four_state_formula() -> None:
+    v00 = torch.randn(2, 4, 6)
+    v10 = torch.randn_like(v00)
+    v01 = torch.randn_like(v00)
+    speaker_scale = 2.5
+    semantic_scale = 2.0
+    expected = v00 + speaker_scale * (v10 - v00) + semantic_scale * (v01 - v00)
     torch.testing.assert_close(
-        combine_dual_cfg_velocity(cond, speaker, semantic, 1.0, 1.0), cond
+        combine_dual_cfg_velocity(v00, v10, v01, speaker_scale, semantic_scale),
+        expected,
     )
+    # At scale zero the helper must return the true all-unconditional state.
     torch.testing.assert_close(
-        combine_dual_cfg_velocity(cond, speaker, semantic, 0.0, 0.0),
-        cond - (cond - semantic) - (cond - speaker),
+        combine_dual_cfg_velocity(v00, v10, v01, 0.0, 0.0), v00
     )
 
 
@@ -96,6 +100,47 @@ def test_batch47_decoder_has_four_speaker_prompts_and_zero_speaker_anchor() -> N
                 projection.bias[hidden : 2 * hidden],
                 torch.zeros(hidden),
             )
+
+
+def test_zero_speaker_cfg_masks_learnable_base_prompt() -> None:
+    torch.manual_seed(48)
+    model = DDLFMDecoder(
+        latent_dim=8,
+        semantic_dim=6,
+        speaker_dim=3,
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        ffn_size=16,
+        num_speaker_prompt_tokens=4,
+    ).eval()
+    with torch.no_grad():
+        model.speaker_prompt.fill_(0.5)
+    captured: dict[str, torch.Tensor] = {}
+    layer = model.layers[0]
+    original = layer._cross_attention_with_rope
+
+    def capture_cross(self, query, semantic, **kwargs):
+        del self
+        captured["semantic"] = semantic.detach().clone()
+        captured["semantic_mask"] = kwargs["semantic_mask"].detach().clone()
+        return original(query, semantic, **kwargs)
+
+    from types import MethodType
+
+    layer._cross_attention_with_rope = MethodType(capture_cross, layer)
+    x = torch.randn(2, 3, 8)
+    semantic = torch.randn(2, 2, 6)
+    speaker = torch.stack([torch.zeros(3), torch.ones(3)], dim=0)
+    model(x, torch.zeros(2), semantic, speaker)
+    # Row 0 is the unconditional branch: all four prompt anchors are zero.
+    torch.testing.assert_close(
+        captured["semantic"][0, :4], torch.zeros(4, 8)
+    )
+    assert not bool(captured["semantic_mask"][0, :4].any())
+    assert bool(captured["semantic_mask"][1, :4].all())
+    # Row 1 remains conditional and retains the learned anchor.
+    assert float(captured["semantic"][1, :4].abs().sum()) > 0.0
 
 
 def test_batch47_aux_endpoint_forward_has_finite_gradients() -> None:

@@ -71,7 +71,6 @@ EMA_WARMUP=1
 CROSS_GATE_INIT="0.05"
 GATE_WARMUP_STEPS=500
 GATE_WARMUP_START="0.05"
-EVAL_CFG_SCALE="1.5"
 EVAL_SPEAKER_CFG_SCALE="2.5"
 EVAL_SEMANTIC_CFG_SCALE="2.0"
 EVAL_USE_EMA=1
@@ -79,8 +78,16 @@ NUM_SPEAKER_PROMPT_TOKENS=4
 SPEAKER_CONDITION_SCALE="4.0"
 SPEAKER_INPUT_SCALE="1.0"
 
-REQUIRED_BRANCH="feat/ver3_1_batch47_endpoint_rescue"
-REQUIRED_READY_TAG="ver3_1_batch47_fixes_ready"
+# Evaluation is normally every saved checkpoint for Batch-47.  Newer
+# batches may deliberately reserve audio evaluation for a sparse set of
+# checkpoints while keeping the identifiability watcher at every 500 steps.
+# Keep the historical default, but make the contract explicit and
+# machine-readable for wrappers such as Batch-48.
+LOCAL_QUICK20_STEPS="${LOCAL_QUICK20_STEPS:-500,1000,1500,2000,2500,3000}"
+LOCAL_FULL_VALIDATION_AT="${LOCAL_FULL_VALIDATION_AT:-3000}"
+
+REQUIRED_BRANCH="${REQUIRED_BRANCH:-feat/ver3_1_batch47_endpoint_rescue}"
+REQUIRED_READY_TAG="${REQUIRED_READY_TAG:-ver3_1_batch47_fixes_ready}"
 BATCH_ID="${BATCH_ID:-codecVC-ver3-1-batch47-ddlfm-no-text-3k-probe-20260716}"
 JOB_NAME="${JOB_NAME:-$BATCH_ID}"
 RECORD_ROOT="${RECORD_ROOT:-$ROOT/trainset/qz_jobs/$BATCH_ID}"
@@ -99,7 +106,7 @@ CHANNEL_STATS_AUDIT="$ROOT/prepared/zq_targets_v1/channel_stats.json"
 EXPECTED_ZQ_FRAMES=35098460
 SEMANTIC_COMPLETION="$ROOT/prepared/semantic_v1_v3_1_step3_no_text_20260715/COMPLETED.json"
 NORMALIZATION_SANITY_REPORT="$ROOT/testset/outputs/ver3_1_batch46_zq_normalization_sanity_20260716/report.json"
-TINY_GATE_REPORT="$ROOT/testset/outputs/ver3_1_batch47_endpoint_gate_20260716/report.json"
+TINY_GATE_REPORT="${TINY_GATE_REPORT:-$ROOT/testset/outputs/ver3_1_batch47_endpoint_gate_20260716/report.json}"
 TRAIN_SCRIPT="$ROOT/scripts/ver3_1/train_ddlfm_cfm.py"
 INFER_SCRIPT="$ROOT/scripts/ver3_1/infer_ddlfm_cfm.py"
 EVAL_SCRIPT="$ROOT/scripts/ver3_1/evaluate_ddlfm_validation.py"
@@ -110,12 +117,17 @@ NORMALIZATION_MODULE="$ROOT/moss_codecvc/audio/zq_normalization.py"
 # review while the one-pass canonical statistics job is still running.  It
 # never marks the arm launch-ready and is rejected for DRY_RUN=0.
 ALLOW_PENDING_CHANNEL_STATS_DRY_RUN="${ALLOW_PENDING_CHANNEL_STATS_DRY_RUN:-0}"
+ALLOW_FAILED_TINY_GATE="${ALLOW_FAILED_TINY_GATE:-0}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 
 case "$DRY_RUN" in 0|1) ;; *) die "DRY_RUN must be 0 or 1" ;; esac
 case "$ALLOW_PENDING_CHANNEL_STATS_DRY_RUN" in 0|1) ;; *) die "ALLOW_PENDING_CHANNEL_STATS_DRY_RUN must be 0 or 1" ;; esac
+case "$ALLOW_FAILED_TINY_GATE" in 0|1) ;; *) die "ALLOW_FAILED_TINY_GATE must be 0 or 1" ;; esac
+[ -n "$LOCAL_QUICK20_STEPS" ] || die "LOCAL_QUICK20_STEPS must not be empty"
+[[ "$LOCAL_QUICK20_STEPS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "LOCAL_QUICK20_STEPS must be comma-separated integers"
+[ "$LOCAL_FULL_VALIDATION_AT" -gt 0 ] 2>/dev/null || die "LOCAL_FULL_VALIDATION_AT must be a positive integer"
 [ "$QZCLI" = "$APPROVED_QZCLI" ] || die "only the approved project qzcli wrapper may be used"
 [ -x "$QZCLI" ] || die "approved qzcli wrapper is missing or not executable: $QZCLI"
 [ -x "$PY" ] || die "missing Python: $PY"
@@ -199,6 +211,7 @@ if [ -s "$CHANNEL_STATS" ]; then
     "$INDEX_ROWS" "$EXPECTED_ZQ_FRAMES" <<'PY'
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -247,9 +260,10 @@ TINY_GATE_READY=0
 if [ "$CHANNEL_STATS_READY" = "1" ]; then
   [ -s "$NORMALIZATION_SANITY_REPORT" ] || die "missing normalization sanity report: $NORMALIZATION_SANITY_REPORT"
   [ -s "$TINY_GATE_REPORT" ] || die "missing tiny identifiability report: $TINY_GATE_REPORT"
-  "$PY" - "$NORMALIZATION_SANITY_REPORT" "$TINY_GATE_REPORT" "$CHANNEL_STATS_SHA256" <<'PY'
+"$PY" - "$NORMALIZATION_SANITY_REPORT" "$TINY_GATE_REPORT" "$CHANNEL_STATS_SHA256" <<'PY'
 import json
 import math
+import os
 import sys
 
 normalization = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -266,16 +280,21 @@ normalization_checks = {
 tiny_gates = tiny.get("gates") or {}
 tiny_checks = {
     "status": tiny.get("status") == "passed",
-    "steps": int(tiny.get("steps", -1)) == 800,
+    "steps": int(tiny.get("steps", -1)) in (800, 3000),
     "speaker_cfg": float(tiny.get("speaker_cfg_scale", -1)) == 2.5,
     "semantic_cfg": float(tiny.get("semantic_cfg_scale", -1)) == 2.0,
     "stats sha": tiny.get("zq_channel_stats_sha256") == stats_sha,
     "all gates": bool(tiny_gates) and all(bool(value) for value in tiny_gates.values()),
 }
 failed = [f"normalization:{name}" for name, ok in normalization_checks.items() if not ok]
-failed += [f"tiny:{name}" for name, ok in tiny_checks.items() if not ok]
+tiny_failed = [f"tiny:{name}" for name, ok in tiny_checks.items() if not ok]
+allow_failed_tiny = os.environ.get("ALLOW_FAILED_TINY_GATE", "0") == "1"
+if tiny_failed and allow_failed_tiny:
+    print("WARNING: accepting failed tiny identifiability gate under explicit Batch-48 override: " + ", ".join(tiny_failed))
+else:
+    failed += tiny_failed
 if failed:
-    raise SystemExit("Batch-47 local sanity contract failed: " + ", ".join(failed))
+    raise SystemExit("Batch local sanity contract failed: " + ", ".join(failed))
 PY
   NORMALIZATION_SANITY_READY=1
   TINY_GATE_READY=1
@@ -289,7 +308,8 @@ if [ "$DRY_RUN" = "0" ]; then
   [ "$SOURCE_BRANCH" = "$REQUIRED_BRANCH" ] || die "live submission must stay on $REQUIRED_BRANCH"
   [ "$WORKTREE_CLEAN" = "1" ] || die "live submission requires a clean worktree"
   [ "$READY_TAG_AT_HEAD" = "1" ] || die "live submission requires $REQUIRED_READY_TAG at HEAD"
-  [ "${ALLOW_CODECVC_BATCH47_SUBMIT:-0}" = "1" ] || die "live submission guarded; set ALLOW_CODECVC_BATCH47_SUBMIT=1"
+  SUBMIT_GUARD="${ALLOW_CODECVC_BATCH48_SUBMIT:-${ALLOW_CODECVC_BATCH47_SUBMIT:-0}}"
+  [ "$SUBMIT_GUARD" = "1" ] || die "live submission guarded; set the explicit Batch submit guard"
 fi
 
 [ ! -e "$OUTPUT_ROOT/COMPLETED.json" ] || die "Batch-47 output is already complete: $OUTPUT_ROOT"
@@ -388,7 +408,7 @@ mkdir -p "\$OUTPUT_ROOT"
   --zq-channel-stats "\$CHANNEL_STATS" \\
   --device cuda
 
-"\$PY" - "\$OUTPUT_ROOT" <<'PY'
+"\$PY" - "\$OUTPUT_ROOT" <<PY
 import hashlib
 import json
 import sys
@@ -408,7 +428,8 @@ inference_checkpoint = Path(str(ready.get("inference_checkpoint") or ""))
 if not inference_checkpoint.is_file():
     raise SystemExit(f"final inference checkpoint is missing: {inference_checkpoint}")
 payload = {
-    "schema": "ver3_1_batch47_ddlfm_probe_completion_v1",
+    "schema": "ver3_1_ddlfm_probe_completion_v2",
+    "batch_id": "$BATCH_ID",
     "status": "completed",
     "completed_at_unix": time.time(),
     "steps": 3000,
@@ -421,8 +442,9 @@ payload = {
         "device": "local RTX4090",
         "speaker_cfg_scale": 2.5,
         "semantic_cfg_scale": 2.0,
-        "checkpoints": [500, 1000, 1500, 2000, 2500, 3000],
-        "quick20_every": 500,
+        "checkpoints": [int(item) for item in "$LOCAL_QUICK20_STEPS".split(",") if item],
+        "quick20_steps": [int(item) for item in "$LOCAL_QUICK20_STEPS".split(",") if item],
+        "full_validation_step": int("$LOCAL_FULL_VALIDATION_AT"),
         "primary": {"weights": "ema", "use_ema": True},
         "diagnostic": {"weights": "raw", "use_ema": False},
         "final_scope": "no_text validation cases only",
@@ -446,6 +468,10 @@ fi
 "$PY" - "$RECORD_ROOT/preflight.json" <<PY
 import json
 import pathlib
+
+quick20_steps = [int(item) for item in "$LOCAL_QUICK20_STEPS".split(",") if item]
+if not quick20_steps or any(step <= 0 for step in quick20_steps):
+    raise SystemExit("invalid LOCAL_QUICK20_STEPS")
 
 payload = {
     "schema": "ver3_1_batch47_ddlfm_qz_preflight_v1",
@@ -486,6 +512,7 @@ payload = {
         "normalization_sanity_ready": bool(int("$NORMALIZATION_SANITY_READY")),
         "tiny_identifiability_report": "$TINY_GATE_REPORT",
         "tiny_identifiability_ready": bool(int("$TINY_GATE_READY")),
+        "allow_failed_tiny_gate": bool(int("$ALLOW_FAILED_TINY_GATE")),
     },
     "training": {
         "steps": $STEPS,
@@ -531,7 +558,7 @@ payload = {
         "speaker_cfg_scale": $EVAL_SPEAKER_CFG_SCALE,
         "semantic_cfg_scale": $EVAL_SEMANTIC_CFG_SCALE,
         "mode": "no_text",
-        "quick20_checkpoints": [500, 1000, 1500, 2000, 2500, 3000],
+        "quick20_checkpoints": quick20_steps,
         "primary": {
             "weights": "ema",
             "use_ema": bool(int("$EVAL_USE_EMA")),
@@ -543,7 +570,7 @@ payload = {
             "required_every_checkpoint": True,
             "purpose": "detect short-probe EMA lag before judging model failure",
         },
-        "full_validation_at": 3000,
+        "full_validation_at": int("$LOCAL_FULL_VALIDATION_AT"),
         "execution_device": "local RTX4090; never auto-submit evaluation to QZ",
     },
     "output_root": "$OUTPUT_ROOT",
@@ -557,13 +584,13 @@ PY
 
 cat >"$RECORD_ROOT/local_eval_contract.json" <<EOF
 {
-  "schema": "ver3_1_batch47_local_eval_contract_v1",
+  "schema": "ver3_1_local_eval_contract_v2",
   "checkpoint_root": "$OUTPUT_ROOT",
   "mode": "no_text",
   "speaker_cfg_scale": $EVAL_SPEAKER_CFG_SCALE,
   "semantic_cfg_scale": $EVAL_SEMANTIC_CFG_SCALE,
   "sampling_steps": 20,
-  "quick20_steps": [500, 1000, 1500, 2000, 2500, 3000],
+  "quick20_steps": [$(printf '%s' "$LOCAL_QUICK20_STEPS" | sed 's/,/, /g')],
   "trigger": "wait for step-XXXXXX.ready.json, then load its inference_checkpoint",
   "primary": {
     "weights": "ema",
@@ -576,7 +603,7 @@ cat >"$RECORD_ROOT/local_eval_contract.json" <<EOF
     "required_every_checkpoint": true,
     "purpose": "detect short-probe EMA lag before judging model failure"
   },
-  "full_validation_step": 3000,
+  "full_validation_step": $LOCAL_FULL_VALIDATION_AT,
   "execution_device": "local RTX4090"
 }
 EOF

@@ -897,6 +897,11 @@ def main() -> int:
                     v_target,
                     batch["target_mask"],
                     sample_weight=sample_weight,
+                    # ``sample_weight`` is already divided by the fixed,
+                    # schedule-wide reference above.  Re-normalizing it
+                    # inside ``masked_mse`` would erase that absolute scale
+                    # (and turns a one-example batch into weight 1.0).
+                    normalize_sample_weight=False,
                 )
                 # Endpoint auxiliary objective: the model must predict the
                 # velocity from pure noise rather than relying on target

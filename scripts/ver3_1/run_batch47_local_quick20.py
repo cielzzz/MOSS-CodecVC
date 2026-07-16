@@ -183,6 +183,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=20260715)
     ap.add_argument("--poll-seconds", type=float, default=60.0)
     ap.add_argument("--max-scans", type=int, default=0, help="0 means no limit in watch mode")
+    ap.add_argument(
+        "--steps",
+        default="",
+        help="comma-separated checkpoint steps to evaluate; default is all saved steps",
+    )
     ap.add_argument("--failure-cer-threshold", type=float, default=0.30)
     ap.add_argument(
         "--continue-after-step500-red-flag",
@@ -207,6 +212,16 @@ def resolve_args(args: argparse.Namespace) -> argparse.Namespace:
         "qwen_asr_model",
     ):
         setattr(args, name, Path(getattr(args, name)).expanduser().resolve())
+    if args.steps.strip():
+        try:
+            selected = tuple(int(item.strip()) for item in args.steps.split(",") if item.strip())
+        except ValueError as exc:
+            raise ValueError("--steps must be comma-separated positive integers") from exc
+        if not selected or any(step not in STEPS for step in selected) or len(set(selected)) != len(selected):
+            raise ValueError(f"--steps must be a unique subset of {STEPS}")
+        args.eval_steps = selected
+    else:
+        args.eval_steps = STEPS
     return args
 
 
@@ -335,6 +350,19 @@ def command_plan(args: argparse.Namespace, checkpoint: Path, step: int, variant:
     paired_csv = directory / f"{rid}.paired_metrics.csv"
     paired_json = directory / f"{rid}.paired_metrics.summary.json"
     paired_md = directory / f"{rid}.paired_metrics.summary.md"
+    diagnosis_dir = directory / "identifiability"
+    diagnosis = [
+        str(args.moss_python),
+        str(ROOT / "scripts/ver3_1/run_batch47_endpoint_gate.py"),
+        "--checkpoint", str(checkpoint),
+        "--weights", "ema" if variant.use_ema else "raw",
+        "--output-dir", str(diagnosis_dir),
+        "--device", str(args.inference_device),
+        "--speaker-cfg-scale", str(args.cfg_scale),
+        "--semantic-cfg-scale", str(args.semantic_cfg_scale),
+        "--zq-channel-stats", str(args.zq_channel_stats),
+        "--overwrite",
+    ]
     inference = [
         str(args.moss_python),
         str(ROOT / "scripts/ver3_1/evaluate_ddlfm_validation.py"),
@@ -416,6 +444,7 @@ def command_plan(args: argparse.Namespace, checkpoint: Path, step: int, variant:
         "asr": asr,
         "asr_summary": summarize,
         "speaker_summary": speaker,
+        "identifiability": diagnosis,
     }
 
 
@@ -607,7 +636,26 @@ def run_variant(
     if not paired_json.is_file():
         run_command(args, step, variant, "speaker_summary", commands["speaker_summary"])
 
+    diagnosis_path = directory / "identifiability" / "checkpoint_identifiability.json"
+    if not diagnosis_path.is_file():
+        run_command(args, step, variant, "identifiability", commands["identifiability"])
+    diagnosis_payload = json.loads(diagnosis_path.read_text(encoding="utf-8"))
+    if diagnosis_payload.get("status") != "completed":
+        raise ValueError(f"invalid identifiability completion: {diagnosis_path}")
+
     metrics = load_variant_metrics(args, step, variant)
+    metrics["identifiability_report"] = str(diagnosis_path)
+    diag_metrics = diagnosis_payload.get("metrics") or {}
+    metrics["speaker_advantage"] = diag_metrics.get(
+        "raw_speaker_cond_vs_zero_relative_to_target_rms",
+        diag_metrics.get("speaker_raw_cond_vs_zero_relative_to_target_rms"),
+    )
+    metrics["free_ode_matched_cosine"] = diag_metrics.get(
+        "raw_matched_ode_cosine", diag_metrics.get("matched_ode_cosine")
+    )
+    metrics["t0_semantic_advantage"] = diag_metrics.get(
+        "raw_matched_t0_advantage", diag_metrics.get("matched_t0_advantage")
+    )
     if metrics["n"] != 20:
         raise ValueError(f"speaker summary is not 20 rows: {metrics['n']}")
     evaluator = json.loads(evaluator_completion.read_text(encoding="utf-8"))
@@ -650,7 +698,7 @@ def run_variant(
 
 def completed_metrics(args: argparse.Namespace) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for step in STEPS:
+    for step in args.eval_steps:
         for variant in VARIANTS:
             path = variant_completion(args, step, variant)
             if path.is_file():
@@ -669,7 +717,7 @@ def write_aggregate(args: argparse.Namespace) -> None:
         "task_name": args.task_name,
         "checkpoint_root": str(args.checkpoint_root),
         "validation_jsonl": str(args.validation_jsonl),
-        "steps": list(STEPS),
+        "steps": list(args.eval_steps),
         "variants": [variant.key for variant in VARIANTS],
         "rows": rows,
     }
@@ -779,7 +827,7 @@ def evaluate_step500_gate(args: argparse.Namespace) -> str:
 def plan_payload(args: argparse.Namespace, conditions: dict[str, Any]) -> dict[str, Any]:
     dependencies = dependency_status(args)
     steps: list[dict[str, Any]] = []
-    for step in STEPS:
+    for step in args.eval_steps:
         ready = ready_marker(args, step)
         checkpoint = ready[2] if ready else args.checkpoint_root / f"step-{step:06d}.infer.pt"
         steps.append({
@@ -849,7 +897,7 @@ def scan_once(args: argparse.Namespace) -> str:
             flush=True,
         )
         return "waiting"
-    for step in STEPS:
+    for step in args.eval_steps:
         if all(variant_completion(args, step, variant).is_file() for variant in VARIANTS):
             continue
         ready = ready_marker(args, step)
@@ -882,7 +930,7 @@ def scan_once(args: argparse.Namespace) -> str:
                 flush=True,
             )
         write_aggregate(args)
-        if step == 500:
+        if step == 500 and 500 in args.eval_steps:
             gate = evaluate_step500_gate(args)
             if gate == "ema_lag_warning":
                 print(

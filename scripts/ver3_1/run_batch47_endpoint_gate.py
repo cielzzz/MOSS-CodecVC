@@ -41,7 +41,11 @@ from scripts.ver3_1.train_ddlfm_cfm import (
     masked_mse,
     sample_cfm_time,
 )
-from scripts.ver3_1.infer_ddlfm_cfm import combine_cfg_velocity, combine_dual_cfg_velocity
+from scripts.ver3_1.infer_ddlfm_cfm import (
+    combine_cfg_velocity,
+    combine_dual_cfg_velocity,
+    load_checkpoint,
+)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -69,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux-warmup-steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=20260716)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--checkpoint", default="", help="Evaluate an existing inference checkpoint instead of training")
+    parser.add_argument("--weights", choices=("raw", "ema"), default="ema")
     return parser.parse_args()
 
 
@@ -208,86 +214,135 @@ def evaluate_identifiability(
     zero_semantic = torch.zeros_like(semantic)
     zero_semantic_mask = torch.zeros_like(semantic_mask)
 
+    def raw_velocity(
+        x: torch.Tensor,
+        t: torch.Tensor,
+        sem: torch.Tensor,
+        spk: torch.Tensor,
+        sem_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Unconditional-free conditional forward, with no CFG mixing."""
+
+        return conditional_velocity(x, t, sem, spk, sem_mask)
+
     def guided_velocity(
         x: torch.Tensor,
         t: torch.Tensor,
         sem: torch.Tensor,
         spk: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        conditioned = conditional_velocity(x, t, sem, spk)
+        # Batch-48 uses the standard four-state additive dual-CFG contract:
+        # v00 + lambda_s (v10-v00) + lambda_c (v01-v00).  Keep v00 as the
+        # returned second value so endpoint diagnostics do not mistake a
+        # semantic-only state for the unconditional baseline.
+        unconditional = conditional_velocity(
+            x, t, zero_semantic, torch.zeros_like(spk), zero_semantic_mask
+        )
         speaker_only = conditional_velocity(x, t, zero_semantic, spk, zero_semantic_mask)
         semantic_only = conditional_velocity(x, t, sem, torch.zeros_like(spk))
         guided = combine_dual_cfg_velocity(
-            conditioned,
+            unconditional,
             speaker_only,
             semantic_only,
             float(speaker_cfg_scale),
             float(semantic_cfg_scale),
         )
-        return guided, semantic_only
+        return guided, unconditional
 
-    matched_velocity, matched_unconditioned = guided_velocity(noise, t0, semantic, speaker)
-    shuffled_velocity, _ = guided_velocity(noise, t0, semantic.flip(0), speaker)
-    permuted_velocity, _ = guided_velocity(noise, t0, semantic.flip(1), speaker)
-    alternate_velocity, _ = guided_velocity(noise, t0, semantic, alternate_speaker)
-    zero_velocity = matched_unconditioned
-
-    matched_t0_mse = float(torch.mean((matched_velocity - v_target) ** 2).item())
-    shuffled_t0_mse = float(torch.mean((shuffled_velocity - v_target) ** 2).item())
+    # Batch-48 gates are deliberately raw: no CFG scale is allowed to make a
+    # weak speaker/semantic path look stronger.  The guided values below are
+    # retained only as a diagnostic reference.
+    raw_matched_velocity = raw_velocity(noise, t0, semantic, speaker)
+    raw_shuffled_velocity = raw_velocity(noise, t0, semantic.flip(0), speaker)
+    raw_permuted_velocity = raw_velocity(noise, t0, semantic.flip(1), speaker)
+    raw_alternate_velocity = raw_velocity(noise, t0, semantic, alternate_speaker)
+    raw_zero_speaker = raw_velocity(noise, t0, semantic, torch.zeros_like(speaker))
+    cfg_matched_velocity, cfg_unconditioned = guided_velocity(noise, t0, semantic, speaker)
+    cfg_shuffled_velocity, _ = guided_velocity(noise, t0, semantic.flip(0), speaker)
+    cfg_permuted_velocity, _ = guided_velocity(noise, t0, semantic.flip(1), speaker)
+    cfg_alternate_velocity, _ = guided_velocity(noise, t0, semantic, alternate_speaker)
 
     target_velocity_rms = torch.mean(v_target**2).sqrt().clamp_min(1.0e-6)
 
-    def delta_metrics(other: torch.Tensor) -> tuple[float, float]:
-        numerator = torch.mean((other - matched_velocity) ** 2).sqrt()
+    def delta_metrics(other: torch.Tensor, matched: torch.Tensor) -> tuple[float, float]:
+        numerator = torch.mean((other - matched) ** 2).sqrt()
         return float(numerator.item()), float((numerator / target_velocity_rms).item())
 
-    def integrate(sem: torch.Tensor, spk: torch.Tensor) -> torch.Tensor:
+    def integrate_raw(sem: torch.Tensor, spk: torch.Tensor) -> torch.Tensor:
         x = noise.clone()
         for step in range(int(ode_steps)):
             t = torch.full((batch,), float(step) / float(ode_steps), device=target.device)
-            velocity, _ = guided_velocity(x, t, sem, spk)
+            velocity = raw_velocity(x, t, sem, spk)
             x = x + velocity / float(ode_steps)
         return x
 
-    matched_ode = integrate(semantic, speaker)
-    shuffled_ode = integrate(semantic.flip(0), speaker)
-    matched_ode_mse = float(torch.mean((matched_ode - target) ** 2).item())
-    shuffled_ode_mse = float(torch.mean((shuffled_ode - target) ** 2).item())
-    matched_cosine = float(
-        torch.nn.functional.cosine_similarity(matched_ode.flatten(1), target.flatten(1), dim=1).mean().item()
+    raw_matched_ode = integrate_raw(semantic, speaker)
+    raw_shuffled_ode = integrate_raw(semantic.flip(0), speaker)
+    raw_matched_ode_mse = float(torch.mean((raw_matched_ode - target) ** 2).item())
+    raw_shuffled_ode_mse = float(torch.mean((raw_shuffled_ode - target) ** 2).item())
+    raw_matched_cosine = float(
+        torch.nn.functional.cosine_similarity(raw_matched_ode.flatten(1), target.flatten(1), dim=1).mean().item()
     )
-    shuffled_cosine = float(
-        torch.nn.functional.cosine_similarity(shuffled_ode.flatten(1), target.flatten(1), dim=1).mean().item()
+    raw_shuffled_cosine = float(
+        torch.nn.functional.cosine_similarity(raw_shuffled_ode.flatten(1), target.flatten(1), dim=1).mean().item()
     )
-    permutation_abs, permutation_rel = delta_metrics(permuted_velocity)
-    alternate_abs, alternate_rel = delta_metrics(alternate_velocity)
-    zero_abs, zero_rel = delta_metrics(zero_velocity)
-    raw_conditioned = conditional_velocity(noise, t0, semantic, speaker)
-    raw_zero_speaker = conditional_velocity(noise, t0, semantic, torch.zeros_like(speaker))
-    speaker_raw_abs = float(torch.mean((raw_conditioned - raw_zero_speaker) ** 2).sqrt().item())
-    speaker_abs = float(torch.mean((matched_velocity - raw_zero_speaker) ** 2).sqrt().item())
-    speaker_rel = speaker_abs / float(target_velocity_rms.item())
-    speaker_raw_rel = speaker_raw_abs / float(target_velocity_rms.item())
+    raw_matched_t0_mse = float(torch.mean((raw_matched_velocity - v_target) ** 2).item())
+    raw_shuffled_t0_mse = float(torch.mean((raw_shuffled_velocity - v_target) ** 2).item())
+    raw_permutation_abs, raw_permutation_rel = delta_metrics(raw_permuted_velocity, raw_matched_velocity)
+    raw_alternate_abs, raw_alternate_rel = delta_metrics(raw_alternate_velocity, raw_matched_velocity)
+    raw_zero_abs, raw_zero_rel = delta_metrics(raw_zero_speaker, raw_matched_velocity)
+    speaker_raw_abs = raw_zero_abs
+    speaker_raw_rel = raw_zero_rel
+    cfg_permutation_abs, cfg_permutation_rel = delta_metrics(cfg_permuted_velocity, cfg_matched_velocity)
+    cfg_alternate_abs, cfg_alternate_rel = delta_metrics(cfg_alternate_velocity, cfg_matched_velocity)
+    cfg_zero_abs, cfg_zero_rel = delta_metrics(cfg_unconditioned, cfg_matched_velocity)
+    cfg_matched_t0_mse = float(torch.mean((cfg_matched_velocity - v_target) ** 2).item())
+    cfg_shuffled_t0_mse = float(torch.mean((cfg_shuffled_velocity - v_target) ** 2).item())
     return {
         "speaker_cfg_scale": float(speaker_cfg_scale),
         "semantic_cfg_scale": float(semantic_cfg_scale),
-        "matched_t0_mse": matched_t0_mse,
-        "shuffled_t0_mse": shuffled_t0_mse,
-        "matched_t0_advantage": (shuffled_t0_mse - matched_t0_mse) / max(shuffled_t0_mse, 1.0e-8),
-        "semantic_permutation_absolute_rms": permutation_abs,
-        "semantic_permutation_relative_to_target_rms": permutation_rel,
-        "alternate_speaker_absolute_rms": alternate_abs,
-        "alternate_speaker_relative_to_target_rms": alternate_rel,
-        "zero_speaker_absolute_rms": zero_abs,
-        "zero_speaker_relative_to_target_rms": zero_rel,
-        "speaker_advantage_relative_to_target_rms": speaker_rel,
+        "cfg_formula": "four_state_v00_v10_v01",
+        "raw_matched_t0_mse": raw_matched_t0_mse,
+        "raw_shuffled_t0_mse": raw_shuffled_t0_mse,
+        "raw_matched_t0_advantage": (raw_shuffled_t0_mse - raw_matched_t0_mse) / max(raw_shuffled_t0_mse, 1.0e-8),
+        "raw_semantic_permutation_absolute_rms": raw_permutation_abs,
+        "raw_semantic_permutation_relative_to_target_rms": raw_permutation_rel,
+        "raw_alternate_speaker_absolute_rms": raw_alternate_abs,
+        "raw_alternate_speaker_relative_to_target_rms": raw_alternate_rel,
+        "raw_zero_speaker_absolute_rms": raw_zero_abs,
+        "raw_zero_speaker_relative_to_target_rms": raw_zero_rel,
+        "raw_speaker_cond_vs_zero_relative_to_target_rms": speaker_raw_rel,
+        "raw_matched_ode_mse": raw_matched_ode_mse,
+        "raw_shuffled_ode_mse": raw_shuffled_ode_mse,
+        "raw_matched_ode_advantage": (raw_shuffled_ode_mse - raw_matched_ode_mse) / max(raw_shuffled_ode_mse, 1.0e-8),
+        "raw_matched_ode_cosine": raw_matched_cosine,
+        "raw_shuffled_ode_cosine": raw_shuffled_cosine,
+        "raw_ode_cosine_advantage": raw_matched_cosine - raw_shuffled_cosine,
+        # Backward-compatible aliases now intentionally mean raw metrics.
+        "matched_t0_mse": raw_matched_t0_mse,
+        "shuffled_t0_mse": raw_shuffled_t0_mse,
+        "matched_t0_advantage": (raw_shuffled_t0_mse - raw_matched_t0_mse) / max(raw_shuffled_t0_mse, 1.0e-8),
+        "semantic_permutation_absolute_rms": raw_permutation_abs,
+        "semantic_permutation_relative_to_target_rms": raw_permutation_rel,
+        "alternate_speaker_absolute_rms": raw_alternate_abs,
+        "alternate_speaker_relative_to_target_rms": raw_alternate_rel,
+        "zero_speaker_absolute_rms": raw_zero_abs,
+        "zero_speaker_relative_to_target_rms": raw_zero_rel,
+        "speaker_advantage_relative_to_target_rms": speaker_raw_rel,
         "speaker_raw_cond_vs_zero_relative_to_target_rms": speaker_raw_rel,
-        "matched_ode_mse": matched_ode_mse,
-        "shuffled_ode_mse": shuffled_ode_mse,
-        "matched_ode_advantage": (shuffled_ode_mse - matched_ode_mse) / max(shuffled_ode_mse, 1.0e-8),
-        "matched_ode_cosine": matched_cosine,
-        "shuffled_ode_cosine": shuffled_cosine,
-        "ode_cosine_advantage": matched_cosine - shuffled_cosine,
+        "speaker_cfg_advantage_relative_to_target_rms": cfg_zero_rel,
+        "cfg_matched_t0_mse": cfg_matched_t0_mse,
+        "cfg_shuffled_t0_mse": cfg_shuffled_t0_mse,
+        "cfg_matched_t0_advantage": (cfg_shuffled_t0_mse - cfg_matched_t0_mse) / max(cfg_shuffled_t0_mse, 1.0e-8),
+        "cfg_semantic_permutation_relative_to_target_rms": cfg_permutation_rel,
+        "cfg_alternate_speaker_relative_to_target_rms": cfg_alternate_rel,
+        "cfg_zero_speaker_relative_to_target_rms": cfg_zero_rel,
+        "matched_ode_mse": raw_matched_ode_mse,
+        "shuffled_ode_mse": raw_shuffled_ode_mse,
+        "matched_ode_advantage": (raw_shuffled_ode_mse - raw_matched_ode_mse) / max(raw_shuffled_ode_mse, 1.0e-8),
+        "matched_ode_cosine": raw_matched_cosine,
+        "shuffled_ode_cosine": raw_shuffled_cosine,
+        "ode_cosine_advantage": raw_matched_cosine - raw_shuffled_cosine,
     }
 
 
@@ -323,6 +378,51 @@ def main() -> int:
         stats,
         device,
     )
+
+    if str(args.checkpoint):
+        checkpoint_path = Path(args.checkpoint).expanduser().resolve()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"checkpoint does not exist: {checkpoint_path}")
+        module, checkpoint_cfg = load_checkpoint(
+            checkpoint_path,
+            device,
+            use_ema=str(args.weights) == "ema",
+        )
+        metrics = evaluate_identifiability(
+            module,
+            target,
+            semantic,
+            speaker,
+            alternate_speaker,
+            ode_steps=int(args.ode_steps),
+            speaker_cfg_scale=float(args.speaker_cfg_scale),
+            semantic_cfg_scale=float(args.semantic_cfg_scale),
+            seed=int(args.seed) + 1,
+        )
+        report = {
+            "schema": "ver3_1_batch48_identifiability_v1",
+            "status": "completed",
+            "purpose": "fixed real-data endpoint identifiability diagnostic; no training",
+            "cfg_formula": "four_state_additive_v1",
+            "checkpoint": str(checkpoint_path),
+            "weights": str(args.weights),
+            "device": str(device),
+            "steps": int(args.ode_steps),
+            "speaker_cfg_scale": float(args.speaker_cfg_scale),
+            "semantic_cfg_scale": float(args.semantic_cfg_scale),
+            "metrics": metrics,
+            "checkpoint_config": {
+                "speaker_condition_scale": checkpoint_cfg.get("speaker_condition_scale"),
+                "speaker_input_scale": checkpoint_cfg.get("speaker_input_scale"),
+                "num_speaker_prompt_tokens": checkpoint_cfg.get("num_speaker_prompt_tokens"),
+            },
+        }
+        (output_dir / "checkpoint_identifiability.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+        return 0
 
     module = DDLFMTrainModule(model_args()).to(device)
     optimizer = torch.optim.AdamW(module.parameters(), lr=float(args.lr), betas=(0.9, 0.95), weight_decay=0.01)
@@ -427,19 +527,20 @@ def main() -> int:
     last_window = float(np.mean(losses[-min(50, len(losses)) :]))
     gates = {
         "loss_finite_and_bounded": math.isfinite(last_window) and last_window < 1.50 * first_window,
-        "raw_t0_semantic_advantage_ge_10pct": raw_metrics["matched_t0_advantage"] >= 0.10,
-        "raw_semantic_permutation_sensitivity_ge_1pct": raw_metrics["semantic_permutation_relative_to_target_rms"] >= 0.01,
-        "raw_cond_vs_zero_speaker_sensitivity_ge_15pct": raw_metrics["speaker_advantage_relative_to_target_rms"] >= 0.15,
-        "raw_free_ode_semantic_advantage_positive": raw_metrics["matched_ode_advantage"] > 0.0,
-        "ema_t0_semantic_advantage_ge_5pct": ema_metrics["matched_t0_advantage"] >= 0.05,
-        "ema_semantic_permutation_sensitivity_ge_0_5pct": ema_metrics["semantic_permutation_relative_to_target_rms"] >= 0.005,
-        "ema_cond_vs_zero_speaker_sensitivity_ge_15pct": ema_metrics["speaker_advantage_relative_to_target_rms"] >= 0.15,
-        "ema_free_ode_semantic_advantage_positive": ema_metrics["matched_ode_advantage"] > 0.0,
+        "raw_t0_semantic_advantage_ge_10pct": raw_metrics["raw_matched_t0_advantage"] >= 0.10,
+        "raw_semantic_permutation_sensitivity_ge_1pct": raw_metrics["raw_semantic_permutation_relative_to_target_rms"] >= 0.01,
+        "raw_cond_vs_zero_speaker_sensitivity_ge_15pct": raw_metrics["raw_speaker_cond_vs_zero_relative_to_target_rms"] >= 0.15,
+        "raw_free_ode_semantic_advantage_positive": raw_metrics["raw_matched_ode_advantage"] > 0.0,
+        "ema_t0_semantic_advantage_ge_5pct": ema_metrics["raw_matched_t0_advantage"] >= 0.05,
+        "ema_semantic_permutation_sensitivity_ge_0_5pct": ema_metrics["raw_semantic_permutation_relative_to_target_rms"] >= 0.005,
+        "ema_cond_vs_zero_speaker_sensitivity_ge_15pct": ema_metrics["raw_speaker_cond_vs_zero_relative_to_target_rms"] >= 0.15,
+        "ema_free_ode_semantic_advantage_positive": ema_metrics["raw_matched_ode_advantage"] > 0.0,
     }
     report = {
-        "schema": "ver3_1_batch47_endpoint_gate_v1",
+        "schema": "ver3_1_batch48_identifiability_v1",
         "status": "passed" if all(gates.values()) else "failed",
         "purpose": "local structural identifiability gate; not a quality benchmark",
+        "cfg_formula": "four_state_additive_v1",
         "device": str(device),
         "steps": int(args.steps),
         "frames": int(args.frames),

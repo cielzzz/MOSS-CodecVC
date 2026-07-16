@@ -580,9 +580,20 @@ class DDLFMDecoder(nn.Module):
         semantic = semantic.to(dtype=x.dtype)
         semantic = semantic + self.modality_embedding(semantic_modality).unsqueeze(1).to(dtype=x.dtype)
         semantic = self.semantic_proj(semantic).masked_fill(~semantic_mask.unsqueeze(-1), 0.0)
+        # A zero speaker embedding is the classifier-free unconditional
+        # branch.  The learnable ``speaker_prompt`` anchors are useful for a
+        # conditional row, but must not survive into that branch or they leak
+        # a fixed speaker signal into ``v(∅, ·)``.  Keep the mask row-wise so
+        # ordinary non-zero speaker embeddings retain the learned anchors.
+        speaker_active = (
+            speaker.detach().abs().sum(dim=-1, keepdim=True) > 1.0e-8
+        ).to(dtype=x.dtype)
         prompt_tokens = []
         for index, mlp in enumerate(self.speaker_prompt_mlps):
-            prompt = mlp(speaker.to(dtype=x.dtype)) + self.speaker_prompt[:, index, :].to(dtype=x.dtype)
+            prompt = mlp(speaker.to(dtype=x.dtype)) + (
+                self.speaker_prompt[:, index, :].to(dtype=x.dtype)
+                * speaker_active
+            )
             prompt_tokens.append(prompt.unsqueeze(1))
         speaker_token = torch.cat(prompt_tokens, dim=1)
         # condition_gate_scale=0 is the exact no-condition control used by
@@ -592,14 +603,12 @@ class DDLFMDecoder(nn.Module):
         # semantic duration and batch padding.  Their RoPE positions are
         # negative; semantic frames retain positions 0..S-1.
         semantic = torch.cat([speaker_token, semantic], dim=1)
+        prompt_mask = speaker_active.bool().expand(
+            -1, self.num_speaker_prompt_tokens
+        )
         semantic_mask = torch.cat(
             [
-                torch.ones(
-                    batch,
-                    self.num_speaker_prompt_tokens,
-                    dtype=torch.bool,
-                    device=x.device,
-                ),
+                prompt_mask,
                 semantic_mask,
             ],
             dim=1,

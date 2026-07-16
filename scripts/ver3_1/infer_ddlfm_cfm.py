@@ -51,31 +51,34 @@ def combine_cfg_velocity(
 
 
 def combine_dual_cfg_velocity(
-    velocity_cond: torch.Tensor,
+    velocity_uncond: torch.Tensor,
     velocity_speaker: torch.Tensor,
     velocity_semantic: torch.Tensor,
     speaker_scale: float,
     semantic_scale: float,
 ) -> torch.Tensor:
-    """Independent CFG anchored at the fully conditioned velocity.
+    """Combine the four-state, additive dual-CFG estimate.
 
-    ``velocity_cond`` is v11 (speaker + semantic), ``velocity_speaker`` is
-    v10 (speaker only) and ``velocity_semantic`` is v01 (semantic only).  The
-    anchored form is identity-preserving at scale (1,1): it returns v11 rather
-    than the additive ``v00 + ...`` approximation, which would silently drop
-    the learned interaction term.
+    The arguments are the three states needed by the standard formula:
+
+    ``velocity_uncond = v(∅,∅)``, ``velocity_speaker = v(s,∅)`` and
+    ``velocity_semantic = v(∅,c)``.  The fully conditioned ``v(s,c)`` is not
+    used by this formula.  Keeping the helper named ``combine_dual...``
+    preserves the existing call surface while making the contract explicit.
     """
 
-    if not (velocity_cond.shape == velocity_speaker.shape == velocity_semantic.shape):
+    if not (
+        velocity_uncond.shape
+        == velocity_speaker.shape
+        == velocity_semantic.shape
+    ):
         raise ValueError("dual CFG velocity tensors must have identical shapes")
     for name, value in (("speaker_scale", speaker_scale), ("semantic_scale", semantic_scale)):
         if not math.isfinite(float(value)) or float(value) < 0.0:
             raise ValueError(f"{name} must be finite and non-negative")
-    return (
-        velocity_cond
-        + (float(speaker_scale) - 1.0) * (velocity_cond - velocity_semantic)
-        + (float(semantic_scale) - 1.0) * (velocity_cond - velocity_speaker)
-    )
+    return velocity_uncond + float(speaker_scale) * (
+        velocity_speaker - velocity_uncond
+    ) + float(semantic_scale) * (velocity_semantic - velocity_uncond)
 
 
 def parse_args() -> argparse.Namespace:
@@ -221,10 +224,10 @@ def sample_velocity(
         t = torch.full((1,), t_value, device=device)
         modality_tensor = torch.tensor([int(modality)], device=device)
         if float(semantic_cfg_scale) > 0.0:
-            velocity_cond = module.decoder(
-                x, t, semantic, speaker,
+            velocity_uncond = module.decoder(
+                x, t, zero_semantic, zero_speaker,
                 target_mask=target_mask,
-                semantic_mask=semantic_mask,
+                semantic_mask=zero_semantic_mask,
                 semantic_modality=modality_tensor,
             ).velocity
             velocity_speaker = module.decoder(
@@ -240,7 +243,7 @@ def sample_velocity(
                 semantic_modality=modality_tensor,
             ).velocity
             velocity = combine_dual_cfg_velocity(
-                velocity_cond,
+                velocity_uncond,
                 velocity_speaker,
                 velocity_semantic,
                 float(cfg_scale),
@@ -390,6 +393,7 @@ def main() -> int:
         "cfg_scale": cfg_scale,
         "speaker_cfg_scale": speaker_cfg_scale,
         "semantic_cfg_scale": semantic_cfg_scale,
+        "cfg_formula": "four_state_additive_v1" if semantic_cfg_scale > 0.0 else "single_condition_v1",
         "using_ema": using_ema,
         "zq_normalization_enabled": normalization_enabled,
         "zq_channel_stats": str(stats_path) if stats_path is not None else None,

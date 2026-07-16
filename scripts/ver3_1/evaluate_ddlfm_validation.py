@@ -491,10 +491,10 @@ def sample_velocity_batch(
     for index in range(int(steps)):
         t = torch.full((batch,), float(index) / float(steps), device=device)
         if float(semantic_cfg_scale) > 0.0:
-            velocity_cond = module.decoder(
-                x, t, semantic, speaker,
+            velocity_uncond = module.decoder(
+                x, t, zero_semantic, zero_speaker,
                 target_mask=target_mask,
-                semantic_mask=semantic_mask,
+                semantic_mask=zero_semantic_mask,
                 semantic_modality=modality,
             ).velocity
             velocity_speaker = module.decoder(
@@ -510,7 +510,7 @@ def sample_velocity_batch(
                 semantic_modality=modality,
             ).velocity
             velocity = combine_dual_cfg_velocity(
-                velocity_cond,
+                velocity_uncond,
                 velocity_speaker,
                 velocity_semantic,
                 float(cfg_scale),
@@ -607,6 +607,7 @@ def write_wavs(bundle: ResourceBundle, prepared: list[Prepared], output_dir: Pat
                 "cfg_scale": float(bundle.speaker_cfg_scale),
                 "speaker_cfg_scale": float(bundle.speaker_cfg_scale),
                 "semantic_cfg_scale": float(bundle.semantic_cfg_scale),
+                "cfg_formula": "four_state_additive_v1" if bundle.semantic_cfg_scale > 0.0 else "single_condition_v1",
                 "using_ema": bundle.using_ema,
                 "zq_normalization_enabled": bundle.zq_normalization_enabled,
                 "zq_channel_stats": str(bundle.zq_stats_path) if bundle.zq_stats_path is not None else None,
