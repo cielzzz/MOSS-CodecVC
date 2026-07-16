@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.ver3_1.run_batch46_local_quick20 import (
+from scripts.ver3_1.run_batch47_local_quick20 import (
     READY_SCHEMA,
     VARIANTS,
     ema_lag_warning_path,
@@ -118,5 +118,5 @@ def test_step500_both_lanes_failure_is_hard_red_flag(tmp_path: Path) -> None:
     assert evaluate_step500_gate(args) == "hard_red_flag"
     marker = json.loads(red_flag_path(args).read_text())
     assert marker["status"] == "red_flag"
-    assert "both EMA+CFG1.5 and raw+CFG1.5" in marker["reason"]
+    assert "both EMA+speakerCFG2.5+semanticCFG2.0" in marker["reason"]
     assert "training is not stopped or signalled" in marker["action"]

@@ -359,10 +359,19 @@ def test_ddlfm_decoder_speaker_prompt_is_fixed_position_zero() -> None:
         semantic_mask=semantic_mask,
     )
 
-    expected_prompt = model.speaker_proj(speaker).unsqueeze(1) + model.speaker_prompt
-    assert torch.allclose(captured["semantic"][:, :1], expected_prompt)
+    expected_prompt = torch.cat(
+        [
+            (
+                mlp(speaker) + model.speaker_prompt[:, index, :]
+            ).unsqueeze(1)
+            for index, mlp in enumerate(model.speaker_prompt_mlps)
+        ],
+        dim=1,
+    )
+    assert torch.allclose(captured["semantic"][:, :4], expected_prompt)
+    assert captured["semantic"].shape[1] == 8
     assert captured["semantic_mask"].tolist() == [
-        [True, True, True, True, True],
-        [True, True, True, False, False],
+        [True, True, True, True, True, True, True, True],
+        [True, True, True, True, True, True, False, False],
     ]
-    assert captured["semantic_positions"].tolist() == [0, 1, 2, 3, 4]
+    assert captured["semantic_positions"].tolist() == [-4, -3, -2, -1, 0, 1, 2, 3]

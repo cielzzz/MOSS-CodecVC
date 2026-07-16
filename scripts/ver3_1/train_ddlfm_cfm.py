@@ -64,6 +64,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--num-layers", type=int, default=12)
     ap.add_argument("--num-heads", type=int, default=12)
     ap.add_argument("--ffn-size", type=int, default=3072)
+    ap.add_argument("--num-speaker-prompt-tokens", type=int, default=4)
+    ap.add_argument("--speaker-condition-scale", type=float, default=4.0)
+    ap.add_argument("--speaker-input-scale", type=float, default=1.0)
     ap.add_argument("--text-vocab-size", type=int, default=8001)
     ap.add_argument("--text-padding-id", type=int, default=0)
     ap.add_argument(
@@ -74,11 +77,23 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--t-sampling",
-        choices=("logit_normal", "cosine", "uniform"),
-        default="logit_normal",
+        choices=("shift_low", "mode_shift_low", "logit_normal", "cosine", "uniform"),
+        default="shift_low",
     )
     ap.add_argument("--t-logit-mu", type=float, default=0.0)
     ap.add_argument("--t-logit-sigma", type=float, default=1.0)
+    ap.add_argument(
+        "--t-shift-power",
+        type=float,
+        default=4.0,
+        help="Power for shift_low: t=u**power. 4.0 meets the t<0.3 >70%% contract.",
+    )
+    ap.add_argument(
+        "--t-mode-shift-m",
+        type=float,
+        default=3.0,
+        help="Low-direction mode shift m: t=u/(m-(m-1)u).",
+    )
     ap.add_argument(
         "--loss-weighting",
         choices=("low_t", "high_t", "none"),
@@ -88,9 +103,14 @@ def parse_args() -> argparse.Namespace:
             "literal 1/(1-t+eps) alternative for controlled comparison."
         ),
     )
-    ap.add_argument("--loss-weight-eps", type=float, default=0.05)
-    ap.add_argument("--loss-weight-cap", type=float, default=5.0)
-    ap.add_argument("--speaker-dropout", type=float, default=0.10)
+    ap.add_argument("--loss-weight-eps", type=float, default=0.02)
+    ap.add_argument("--loss-weight-cap", type=float, default=25.0)
+    ap.add_argument("--speaker-dropout", type=float, default=0.25)
+    ap.add_argument("--semantic-dropout", type=float, default=0.15)
+    ap.add_argument("--speaker-cfg-scale", type=float, default=2.5)
+    ap.add_argument("--semantic-cfg-scale", type=float, default=2.0)
+    ap.add_argument("--aux-loss-weight", type=float, default=1.0)
+    ap.add_argument("--aux-warmup-steps", type=int, default=500)
     ap.add_argument("--cross-gate-init", type=float, default=0.05)
     ap.add_argument("--gate-warmup-steps", type=int, default=500)
     ap.add_argument("--gate-warmup-start", type=float, default=0.05)
@@ -299,6 +319,9 @@ class DDLFMTrainModule(nn.Module):
             num_heads=heads,
             ffn_size=ffn,
             cross_gate_init=float(getattr(args, "cross_gate_init", 0.0)),
+            num_speaker_prompt_tokens=int(getattr(args, "num_speaker_prompt_tokens", 4)),
+            speaker_condition_scale=float(getattr(args, "speaker_condition_scale", 4.0)),
+            speaker_input_scale=float(getattr(args, "speaker_input_scale", 1.0)),
         )
         self.text_encoder = SourceTokenMemoryEncoder(
             vocab_size=int(args.text_vocab_size),
@@ -346,6 +369,8 @@ def sample_cfm_time(
     schedule: str,
     logit_mu: float = 0.0,
     logit_sigma: float = 1.0,
+    shift_power: float = 4.0,
+    mode_shift_m: float = 3.0,
 ) -> torch.Tensor:
     """Sample CFM interpolation time with an auditable schedule."""
 
@@ -354,6 +379,19 @@ def sample_cfm_time(
     schedule = str(schedule)
     if schedule == "uniform":
         return torch.rand(int(batch_size), device=device)
+    if schedule == "shift_low":
+        if float(shift_power) <= 0.0 or not math.isfinite(float(shift_power)):
+            raise ValueError("shift_power must be finite and positive")
+        # Power-law low shift.  With power=4, P(t<0.3)=0.740; power=3 is
+        # retained as an explicit ablation but only gives about 0.669.
+        return torch.rand(int(batch_size), device=device).pow(float(shift_power))
+    if schedule == "mode_shift_low":
+        if float(mode_shift_m) <= 1.0 or not math.isfinite(float(mode_shift_m)):
+            raise ValueError("mode_shift_m must be finite and greater than 1")
+        u = torch.rand(int(batch_size), device=device)
+        # Low-direction inverse of the commonly quoted high-shift formula;
+        # median(u)=0.5 maps to 0.5/(m-(m-1)*0.5)=1/(m+1).
+        return u / (float(mode_shift_m) - (float(mode_shift_m) - 1.0) * u)
     if schedule == "cosine":
         u = torch.rand(int(batch_size), device=device)
         return 1.0 - torch.cos(0.5 * math.pi * u)
@@ -371,9 +409,13 @@ def cfm_loss_weights(
     mode: str,
     eps: float,
     cap: float,
+    normalize: bool = True,
 ) -> torch.Tensor:
-    """Return bounded, mean-one per-example velocity-loss weights.
+    """Return bounded per-example velocity-loss weights.
 
+    With ``normalize=True`` the result is mean-one within the supplied batch;
+    Batch-47 training uses ``normalize=False`` plus a fixed schedule-wide
+    reference so a batch of one cannot accidentally cancel the weighting.
     The Batch-46 intent is to strengthen the real inference endpoint ``t≈0``.
     That corresponds to ``1/(t+eps)``.  The literal ``1/(1-t+eps)`` proposal
     instead emphasizes the target endpoint, so it remains available only as
@@ -396,7 +438,38 @@ def cfm_loss_weights(
     else:
         raise ValueError(f"unsupported loss weighting: {mode}")
     raw = raw.clamp(max=float(cap))
+    if not normalize:
+        return raw
     return raw / raw.detach().mean().clamp_min(1.0e-8)
+
+
+def estimate_cfm_weight_reference(
+    *,
+    schedule: str,
+    eps: float,
+    cap: float,
+    shift_power: float = 4.0,
+    mode_shift_m: float = 3.0,
+    samples: int = 200_000,
+) -> float:
+    """Estimate a fixed schedule-wide weight mean for DDP-stable scaling."""
+
+    if str(schedule) == "none" or str(schedule) == "uniform":
+        return 1.0
+    generator = torch.Generator(device="cpu").manual_seed(20260716)
+    if str(schedule) == "shift_low":
+        t = torch.rand(int(samples), generator=generator).pow(float(shift_power))
+    elif str(schedule) == "mode_shift_low":
+        u = torch.rand(int(samples), generator=generator)
+        t = u / (float(mode_shift_m) - (float(mode_shift_m) - 1.0) * u)
+    elif str(schedule) == "logit_normal":
+        t = torch.sigmoid(float(torch.randn(int(samples), generator=generator).mul(1.0)))
+    elif str(schedule) == "cosine":
+        u = torch.rand(int(samples), generator=generator)
+        t = 1.0 - torch.cos(0.5 * math.pi * u)
+    else:
+        raise ValueError(f"unsupported schedule for weight reference: {schedule}")
+    return float(cfm_loss_weights(t, mode="low_t", eps=eps, cap=cap, normalize=False).mean().item())
 
 
 def apply_speaker_dropout(
@@ -417,20 +490,48 @@ def apply_speaker_dropout(
     return dropped, mask
 
 
+def apply_semantic_dropout(
+    semantic: torch.Tensor,
+    semantic_mask: torch.Tensor,
+    probability: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Drop complete semantic memories for semantic classifier-free guidance."""
+
+    if semantic.ndim != 3:
+        raise ValueError(f"semantic must be [B,S,D], got {tuple(semantic.shape)}")
+    if semantic_mask.ndim != 2 or tuple(semantic_mask.shape[:2]) != tuple(semantic.shape[:2]):
+        raise ValueError("semantic_mask must be [B,S] matching semantic")
+    if not 0.0 <= float(probability) <= 1.0:
+        raise ValueError("semantic dropout probability must be in [0, 1]")
+    mask = torch.rand(int(semantic.shape[0]), device=semantic.device) < float(probability)
+    dropped = semantic.clone()
+    dropped_mask = semantic_mask.clone()
+    if bool(mask.any().item()):
+        dropped[mask] = 0.0
+        dropped_mask[mask] = False
+    return dropped, dropped_mask, mask
+
+
 def masked_mse(
     prediction: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
     *,
     sample_weight: torch.Tensor | None = None,
+    normalize_sample_weight: bool = True,
 ) -> torch.Tensor:
-    weight = mask.unsqueeze(-1).to(dtype=prediction.dtype)
-    if sample_weight is not None:
-        if sample_weight.ndim != 1 or int(sample_weight.shape[0]) != int(prediction.shape[0]):
-            raise ValueError("sample_weight must be [B]")
-        weight = weight * sample_weight.to(device=prediction.device, dtype=prediction.dtype)[:, None, None]
-    denom = weight.sum().clamp_min(1.0) * prediction.shape[-1]
-    return ((prediction - target).square() * weight).sum() / denom
+    valid = mask.to(dtype=prediction.dtype)
+    squared = (prediction - target).square().mean(dim=-1)
+    per_example_denom = valid.sum(dim=-1).clamp_min(1.0)
+    per_example = (squared * valid).sum(dim=-1) / per_example_denom
+    if sample_weight is None:
+        return per_example.mean()
+    if sample_weight.ndim != 1 or int(sample_weight.shape[0]) != int(prediction.shape[0]):
+        raise ValueError("sample_weight must be [B]")
+    weights = sample_weight.to(device=prediction.device, dtype=prediction.dtype)
+    if normalize_sample_weight:
+        weights = weights / weights.detach().mean().clamp_min(1.0e-8)
+    return (per_example * weights).mean()
 
 
 class ExponentialMovingAverage:
@@ -630,6 +731,30 @@ def main() -> int:
     args = parse_args()
     if not 0.0 <= float(args.speaker_dropout) < 1.0:
         raise ValueError("speaker-dropout must be in [0, 1)")
+    if not 0.0 <= float(args.semantic_dropout) < 1.0:
+        raise ValueError("semantic-dropout must be in [0, 1)")
+    if float(args.aux_loss_weight) < 0.0:
+        raise ValueError("aux-loss-weight must be non-negative")
+    if int(args.aux_warmup_steps) <= 0:
+        raise ValueError("aux-warmup-steps must be positive")
+    if int(args.num_speaker_prompt_tokens) <= 0:
+        raise ValueError("num-speaker-prompt-tokens must be positive")
+    if not math.isfinite(float(args.speaker_condition_scale)) or float(args.speaker_condition_scale) < 0.0:
+        raise ValueError("speaker-condition-scale must be finite and non-negative")
+    if not math.isfinite(float(args.speaker_input_scale)) or float(args.speaker_input_scale) < 0.0:
+        raise ValueError("speaker-input-scale must be finite and non-negative")
+    if not math.isfinite(float(args.speaker_cfg_scale)) or float(args.speaker_cfg_scale) < 0.0:
+        raise ValueError("speaker-cfg-scale must be finite and non-negative")
+    if not math.isfinite(float(args.semantic_cfg_scale)) or float(args.semantic_cfg_scale) < 0.0:
+        raise ValueError("semantic-cfg-scale must be finite and non-negative")
+    loss_weight_reference = estimate_cfm_weight_reference(
+        schedule=str(args.t_sampling),
+        eps=float(args.loss_weight_eps),
+        cap=float(args.loss_weight_cap),
+        shift_power=float(args.t_shift_power),
+        mode_shift_m=float(args.t_mode_shift_m),
+    )
+    args.loss_weight_reference = float(loss_weight_reference)
     if not 0.0 <= float(args.gate_warmup_start) <= 1.0:
         raise ValueError("gate-warmup-start must be in [0, 1]")
     use_dist, rank, world_size, device = init_distributed()
@@ -706,13 +831,19 @@ def main() -> int:
             group["lr"] = current_lr
         optimizer.zero_grad(set_to_none=True)
         loss_total = 0.0
+        cfm_loss_total = 0.0
+        aux_loss_total = 0.0
         speaker_drop_total = 0
+        semantic_drop_total = 0
         t_sum = 0.0
         t_low_total = 0
+        t_shift_low_total = 0
         loss_weight_min = math.inf
         loss_weight_max = 0.0
         last_t: torch.Tensor | None = None
         last_speaker_input: torch.Tensor | None = None
+        aux_progress = min(1.0, float(step) / max(1, int(args.aux_warmup_steps)))
+        aux_weight = float(args.aux_loss_weight) * aux_progress
         for _micro_step in range(grad_accum_steps):
             batch = next(iterator)
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -723,11 +854,21 @@ def main() -> int:
                 schedule=str(args.t_sampling),
                 logit_mu=float(args.t_logit_mu),
                 logit_sigma=float(args.t_logit_sigma),
+                shift_power=float(args.t_shift_power),
+                mode_shift_m=float(args.t_mode_shift_m),
             )
             noise = torch.randn_like(target)
             x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * target
             v_target = target - noise
             semantic, semantic_mask = raw_module.build_semantic(batch)
+            full_semantic = semantic
+            full_semantic_mask = semantic_mask
+            full_speaker = batch["speaker"]
+            semantic_input, semantic_mask_input, semantic_drop_mask = apply_semantic_dropout(
+                semantic,
+                semantic_mask,
+                float(args.semantic_dropout),
+            )
             speaker_input, speaker_drop_mask = apply_speaker_dropout(
                 batch["speaker"],
                 float(args.speaker_dropout),
@@ -737,31 +878,59 @@ def main() -> int:
                 mode=str(args.loss_weighting),
                 eps=float(args.loss_weight_eps),
                 cap=float(args.loss_weight_cap),
+                normalize=False,
             )
+            sample_weight = sample_weight / float(loss_weight_reference)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 prediction = module(
                     x_t,
                     t,
-                    semantic,
+                    semantic_input,
                     speaker_input,
                     target_mask=batch["target_mask"],
-                    semantic_mask=semantic_mask,
+                    semantic_mask=semantic_mask_input,
                     semantic_modality=batch["mode"],
                     condition_gate_scale=gate_scale,
                 ).velocity
-                loss = masked_mse(
+                cfm_loss = masked_mse(
                     prediction,
                     v_target,
                     batch["target_mask"],
                     sample_weight=sample_weight,
                 )
+                # Endpoint auxiliary objective: the model must predict the
+                # velocity from pure noise rather than relying on target
+                # information already present in x_t at larger t.
+                if aux_weight > 0.0:
+                    aux_prediction = module(
+                        noise,
+                        torch.zeros_like(t),
+                        full_semantic,
+                        full_speaker,
+                        target_mask=batch["target_mask"],
+                        semantic_mask=full_semantic_mask,
+                        semantic_modality=batch["mode"],
+                        condition_gate_scale=gate_scale,
+                    ).velocity
+                    aux_loss = masked_mse(
+                        aux_prediction,
+                        v_target,
+                        batch["target_mask"],
+                    )
+                else:
+                    aux_loss = cfm_loss.new_zeros(())
+                loss = cfm_loss + float(aux_weight) * aux_loss
                 scaled_loss = loss / float(grad_accum_steps)
-            if not torch.isfinite(loss):
+            if not torch.isfinite(loss) or not torch.isfinite(cfm_loss) or not torch.isfinite(aux_loss):
                 raise FloatingPointError(f"non-finite CFM loss at step {step}: {loss}")
             loss_total += float(loss.detach().cpu().item())
+            cfm_loss_total += float(cfm_loss.detach().cpu().item())
+            aux_loss_total += float(aux_loss.detach().cpu().item())
             speaker_drop_total += int(speaker_drop_mask.sum().item())
+            semantic_drop_total += int(semantic_drop_mask.sum().item())
             t_sum += float(t.detach().sum().item())
             t_low_total += int((t < 0.2).sum().item())
+            t_shift_low_total += int((t < 0.3).sum().item())
             loss_weight_min = min(loss_weight_min, float(sample_weight.detach().min().item()))
             loss_weight_max = max(loss_weight_max, float(sample_weight.detach().max().item()))
             last_t = t.detach()
@@ -782,7 +951,17 @@ def main() -> int:
         local_examples = int(args.batch_size) * grad_accum_steps
         if should_log:
             reduced = torch.tensor(
-                [loss_total, t_sum, float(t_low_total), float(speaker_drop_total), float(local_examples)],
+                [
+                    loss_total,
+                    cfm_loss_total,
+                    aux_loss_total,
+                    t_sum,
+                    float(t_low_total),
+                    float(t_shift_low_total),
+                    float(speaker_drop_total),
+                    float(semantic_drop_total),
+                    float(local_examples),
+                ],
                 dtype=torch.float64,
                 device=device,
             )
@@ -792,20 +971,26 @@ def main() -> int:
                 dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
                 dist.all_reduce(reduced_min, op=dist.ReduceOp.MIN)
                 dist.all_reduce(reduced_max, op=dist.ReduceOp.MAX)
-            global_examples = max(1.0, float(reduced[4].item()))
+            global_examples = max(1.0, float(reduced[8].item()))
             global_loss = float(reduced[0].item()) / float(max(1, world_size) * grad_accum_steps)
         if rank == 0 and should_log:
             payload = {
                 "step": step,
                 "loss": global_loss,
+                "cfm_loss": float(reduced[1].item()) / float(max(1, world_size) * grad_accum_steps),
+                "aux_loss": float(reduced[2].item()) / float(max(1, world_size) * grad_accum_steps),
+                "aux_loss_weight": aux_weight,
                 "loss_reduction": "mean_over_ddp_ranks_and_microbatches",
                 "lr": current_lr,
                 "gate_scale": gate_scale,
-                "t_mean": float(reduced[1].item()) / global_examples,
-                "t_lt_0_2_ratio": float(reduced[2].item()) / global_examples,
+                "t_mean": float(reduced[3].item()) / global_examples,
+                "t_lt_0_2_ratio": float(reduced[4].item()) / global_examples,
+                "t_lt_0_3_ratio": float(reduced[5].item()) / global_examples,
                 "loss_weight_min": float(reduced_min.item()),
                 "loss_weight_max": float(reduced_max.item()),
-                "speaker_dropout_ratio": float(reduced[3].item()) / global_examples,
+                "loss_weight_reference": float(loss_weight_reference),
+                "speaker_dropout_ratio": float(reduced[6].item()) / global_examples,
+                "semantic_dropout_ratio": float(reduced[7].item()) / global_examples,
                 "ema_target_decay": float(ema.decay),
                 "ema_effective_decay": float(ema.last_decay),
                 "ema_num_updates": int(ema.num_updates),

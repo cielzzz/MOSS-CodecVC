@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local real-data identifiability gate for the Batch-46 DDLFM retry.
+"""Local real-data endpoint identifiability gate for Batch-47.
 
 This is deliberately a tiny memorization test, not a quality benchmark.  It
 selects two no_text rows that share the same speaker sidecar but have different
@@ -33,13 +33,15 @@ from moss_codecvc.audio.zq_normalization import load_zq_channel_stats, sha256_fi
 from scripts.ver3_1.train_ddlfm_cfm import (
     DDLFMTrainModule,
     ExponentialMovingAverage,
+    apply_semantic_dropout,
     apply_speaker_dropout,
     cfm_loss_weights,
+    estimate_cfm_weight_reference,
     load_embedding,
     masked_mse,
     sample_cfm_time,
 )
-from scripts.ver3_1.infer_ddlfm_cfm import combine_cfg_velocity
+from scripts.ver3_1.infer_ddlfm_cfm import combine_cfg_velocity, combine_dual_cfg_velocity
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -50,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(ROOT / "testset/outputs/ver3_1_batch46_tiny_identifiability_20260716"),
+        default=str(ROOT / "testset/outputs/ver3_1_batch47_endpoint_gate_20260716"),
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--steps", type=int, default=800)
@@ -59,7 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--gate-warmup-steps", type=int, default=100)
     parser.add_argument("--ode-steps", type=int, default=20)
-    parser.add_argument("--cfg-scale", type=float, default=1.5)
+    parser.add_argument("--speaker-cfg-scale", type=float, default=2.5)
+    parser.add_argument("--semantic-cfg-scale", type=float, default=2.0)
+    parser.add_argument("--speaker-dropout", type=float, default=0.25)
+    parser.add_argument("--semantic-dropout", type=float, default=0.15)
+    parser.add_argument("--aux-loss-weight", type=float, default=1.0)
+    parser.add_argument("--aux-warmup-steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=20260716)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -152,6 +159,9 @@ def model_args() -> SimpleNamespace:
         text_padding_id=0,
         smoke_small_model=True,
         cross_gate_init=0.05,
+        num_speaker_prompt_tokens=4,
+        speaker_condition_scale=4.0,
+        speaker_input_scale=1.0,
     )
 
 
@@ -164,7 +174,8 @@ def evaluate_identifiability(
     alternate_speaker: torch.Tensor,
     *,
     ode_steps: int,
-    cfg_scale: float,
+    speaker_cfg_scale: float,
+    semantic_cfg_scale: float,
     seed: int,
 ) -> dict[str, float]:
     module.eval()
@@ -182,6 +193,7 @@ def evaluate_identifiability(
         t: torch.Tensor,
         sem: torch.Tensor,
         spk: torch.Tensor,
+        sem_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return module.decoder(
             x,
@@ -189,9 +201,12 @@ def evaluate_identifiability(
             sem,
             spk,
             target_mask=target_mask,
-            semantic_mask=semantic_mask,
+            semantic_mask=semantic_mask if sem_mask is None else sem_mask,
             semantic_modality=modality,
         ).velocity
+
+    zero_semantic = torch.zeros_like(semantic)
+    zero_semantic_mask = torch.zeros_like(semantic_mask)
 
     def guided_velocity(
         x: torch.Tensor,
@@ -200,8 +215,16 @@ def evaluate_identifiability(
         spk: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         conditioned = conditional_velocity(x, t, sem, spk)
-        unconditioned = conditional_velocity(x, t, sem, torch.zeros_like(spk))
-        return combine_cfg_velocity(conditioned, unconditioned, float(cfg_scale)), unconditioned
+        speaker_only = conditional_velocity(x, t, zero_semantic, spk, zero_semantic_mask)
+        semantic_only = conditional_velocity(x, t, sem, torch.zeros_like(spk))
+        guided = combine_dual_cfg_velocity(
+            conditioned,
+            speaker_only,
+            semantic_only,
+            float(speaker_cfg_scale),
+            float(semantic_cfg_scale),
+        )
+        return guided, semantic_only
 
     matched_velocity, matched_unconditioned = guided_velocity(noise, t0, semantic, speaker)
     shuffled_velocity, _ = guided_velocity(noise, t0, semantic.flip(0), speaker)
@@ -239,8 +262,15 @@ def evaluate_identifiability(
     permutation_abs, permutation_rel = delta_metrics(permuted_velocity)
     alternate_abs, alternate_rel = delta_metrics(alternate_velocity)
     zero_abs, zero_rel = delta_metrics(zero_velocity)
+    raw_conditioned = conditional_velocity(noise, t0, semantic, speaker)
+    raw_zero_speaker = conditional_velocity(noise, t0, semantic, torch.zeros_like(speaker))
+    speaker_raw_abs = float(torch.mean((raw_conditioned - raw_zero_speaker) ** 2).sqrt().item())
+    speaker_abs = float(torch.mean((matched_velocity - raw_zero_speaker) ** 2).sqrt().item())
+    speaker_rel = speaker_abs / float(target_velocity_rms.item())
+    speaker_raw_rel = speaker_raw_abs / float(target_velocity_rms.item())
     return {
-        "cfg_scale": float(cfg_scale),
+        "speaker_cfg_scale": float(speaker_cfg_scale),
+        "semantic_cfg_scale": float(semantic_cfg_scale),
         "matched_t0_mse": matched_t0_mse,
         "shuffled_t0_mse": shuffled_t0_mse,
         "matched_t0_advantage": (shuffled_t0_mse - matched_t0_mse) / max(shuffled_t0_mse, 1.0e-8),
@@ -250,6 +280,8 @@ def evaluate_identifiability(
         "alternate_speaker_relative_to_target_rms": alternate_rel,
         "zero_speaker_absolute_rms": zero_abs,
         "zero_speaker_relative_to_target_rms": zero_rel,
+        "speaker_advantage_relative_to_target_rms": speaker_rel,
+        "speaker_raw_cond_vs_zero_relative_to_target_rms": speaker_raw_rel,
         "matched_ode_mse": matched_ode_mse,
         "shuffled_ode_mse": shuffled_ode_mse,
         "matched_ode_advantage": (shuffled_ode_mse - matched_ode_mse) / max(shuffled_ode_mse, 1.0e-8),
@@ -263,8 +295,13 @@ def main() -> int:
     args = parse_args()
     if args.steps < 100 or args.frames <= 0 or args.ode_steps <= 0:
         raise ValueError("steps must be >=100; frames and ode-steps must be positive")
-    if not math.isfinite(float(args.cfg_scale)) or float(args.cfg_scale) < 0.0:
-        raise ValueError("cfg-scale must be finite and non-negative")
+    if (
+        not math.isfinite(float(args.speaker_cfg_scale))
+        or float(args.speaker_cfg_scale) < 0.0
+        or not math.isfinite(float(args.semantic_cfg_scale))
+        or float(args.semantic_cfg_scale) < 0.0
+    ):
+        raise ValueError("CFG scales must be finite and non-negative")
     output_dir = Path(args.output_dir).expanduser().resolve()
     if output_dir.exists() and any(output_dir.iterdir()) and not args.overwrite:
         raise FileExistsError(f"refusing non-empty output dir without --overwrite: {output_dir}")
@@ -302,23 +339,55 @@ def main() -> int:
             group["lr"] = float(args.lr) * lr_scale
         gate_progress = min(1.0, float(step) / max(1, int(args.gate_warmup_steps)))
         gate_scale = 0.05 + 0.95 * gate_progress
-        t = sample_cfm_time(target.shape[0], device=device, schedule="logit_normal")
+        t = sample_cfm_time(
+            target.shape[0],
+            device=device,
+            schedule="shift_low",
+            shift_power=4.0,
+        )
         noise = torch.randn_like(target)
         x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * target
         v_target = target - noise
-        speaker_input, _ = apply_speaker_dropout(speaker, 0.10)
-        weights = cfm_loss_weights(t, mode="low_t", eps=0.05, cap=5.0)
+        semantic_input, semantic_mask_input, _ = apply_semantic_dropout(
+            semantic,
+            semantic_mask,
+            float(args.semantic_dropout),
+        )
+        speaker_input, _ = apply_speaker_dropout(speaker, float(args.speaker_dropout))
+        weights = cfm_loss_weights(
+            t,
+            mode="low_t",
+            eps=0.02,
+            cap=25.0,
+            normalize=False,
+        )
+        weights = weights / estimate_cfm_weight_reference(
+            schedule="shift_low", eps=0.02, cap=25.0, shift_power=4.0
+        )
         prediction = module(
             x_t,
             t,
-            semantic,
+            semantic_input,
             speaker_input,
+            target_mask=target_mask,
+            semantic_mask=semantic_mask_input,
+            semantic_modality=modality,
+            condition_gate_scale=gate_scale,
+        ).velocity
+        cfm = masked_mse(prediction, v_target, target_mask, sample_weight=weights, normalize_sample_weight=False)
+        aux = module(
+            noise,
+            torch.zeros_like(t),
+            semantic,
+            speaker,
             target_mask=target_mask,
             semantic_mask=semantic_mask,
             semantic_modality=modality,
             condition_gate_scale=gate_scale,
         ).velocity
-        loss = masked_mse(prediction, v_target, target_mask, sample_weight=weights)
+        aux_loss = masked_mse(aux, v_target, target_mask)
+        aux_weight = float(args.aux_loss_weight) * min(1.0, float(step) / max(1, int(args.aux_warmup_steps)))
+        loss = cfm + aux_weight * aux_loss
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite tiny-gate loss at step {step}")
         optimizer.zero_grad(set_to_none=True)
@@ -337,7 +406,8 @@ def main() -> int:
         speaker,
         alternate_speaker,
         ode_steps=int(args.ode_steps),
-        cfg_scale=float(args.cfg_scale),
+        speaker_cfg_scale=float(args.speaker_cfg_scale),
+        semantic_cfg_scale=float(args.semantic_cfg_scale),
         seed=int(args.seed) + 1,
     )
     ema_module = DDLFMTrainModule(model_args()).to(device)
@@ -349,31 +419,33 @@ def main() -> int:
         speaker,
         alternate_speaker,
         ode_steps=int(args.ode_steps),
-        cfg_scale=float(args.cfg_scale),
+        speaker_cfg_scale=float(args.speaker_cfg_scale),
+        semantic_cfg_scale=float(args.semantic_cfg_scale),
         seed=int(args.seed) + 1,
     )
     first_window = float(np.mean(losses[: min(50, len(losses))]))
     last_window = float(np.mean(losses[-min(50, len(losses)) :]))
     gates = {
-        "loss_finite_and_decreasing": math.isfinite(last_window) and last_window < 0.70 * first_window,
+        "loss_finite_and_bounded": math.isfinite(last_window) and last_window < 1.50 * first_window,
         "raw_t0_semantic_advantage_ge_10pct": raw_metrics["matched_t0_advantage"] >= 0.10,
         "raw_semantic_permutation_sensitivity_ge_1pct": raw_metrics["semantic_permutation_relative_to_target_rms"] >= 0.01,
-        "raw_cond_vs_zero_speaker_sensitivity_ge_0_5pct": raw_metrics["zero_speaker_relative_to_target_rms"] >= 0.005,
+        "raw_cond_vs_zero_speaker_sensitivity_ge_15pct": raw_metrics["speaker_advantage_relative_to_target_rms"] >= 0.15,
         "raw_free_ode_semantic_advantage_positive": raw_metrics["matched_ode_advantage"] > 0.0,
         "ema_t0_semantic_advantage_ge_5pct": ema_metrics["matched_t0_advantage"] >= 0.05,
         "ema_semantic_permutation_sensitivity_ge_0_5pct": ema_metrics["semantic_permutation_relative_to_target_rms"] >= 0.005,
-        "ema_cond_vs_zero_speaker_sensitivity_positive": ema_metrics["zero_speaker_relative_to_target_rms"] > 0.0,
+        "ema_cond_vs_zero_speaker_sensitivity_ge_15pct": ema_metrics["speaker_advantage_relative_to_target_rms"] >= 0.15,
         "ema_free_ode_semantic_advantage_positive": ema_metrics["matched_ode_advantage"] > 0.0,
     }
     report = {
-        "schema": "ver3_1_batch46_tiny_identifiability_v1",
+        "schema": "ver3_1_batch47_endpoint_gate_v1",
         "status": "passed" if all(gates.values()) else "failed",
         "purpose": "local structural identifiability gate; not a quality benchmark",
         "device": str(device),
         "steps": int(args.steps),
         "frames": int(args.frames),
         "ode_steps": int(args.ode_steps),
-        "cfg_scale": float(args.cfg_scale),
+        "speaker_cfg_scale": float(args.speaker_cfg_scale),
+        "semantic_cfg_scale": float(args.semantic_cfg_scale),
         "zq_channel_stats": str(stats_path),
         "zq_channel_stats_sha256": sha256_file(stats_path),
         "elapsed_sec": round(time.time() - started, 3),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run/watch the fixed Batch-46 no_text quick20 evaluation on local RTX 4090s.
+"""Run/watch the fixed Batch-47 no_text quick20 evaluation on local RTX 4090s.
 
 The watcher is deliberately checkpoint-marker driven.  It evaluates a step
 only after ``step-XXXXXX.ready.json`` is atomically published by the trainer,
@@ -126,19 +126,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--allow-run", action="store_true")
     ap.add_argument(
         "--task-name",
-        default="codecVC-ver3-1-batch46-local-quick20-20260716",
+        default="codecVC-ver3-1-batch47-local-quick20-20260716",
     )
     ap.add_argument(
         "--checkpoint-root",
-        default=str(ROOT / "outputs/ver3_1_batch46_ddlfm_no_text_probe_20260716"),
+        default=str(ROOT / "outputs/ver3_1_batch47_ddlfm_no_text_probe_20260716"),
     )
     ap.add_argument(
         "--output-root",
-        default=str(ROOT / "testset/outputs/codecVC-ver3-1-batch46-local-quick20-20260716"),
+        default=str(ROOT / "testset/outputs/codecVC-ver3-1-batch47-local-quick20-20260716"),
     )
     ap.add_argument(
         "--record-root",
-        default=str(ROOT / "trainset/local_jobs/codecVC-ver3-1-batch46-local-quick20-20260716"),
+        default=str(ROOT / "trainset/local_jobs/codecVC-ver3-1-batch47-local-quick20-20260716"),
     )
     ap.add_argument(
         "--validation-jsonl",
@@ -178,7 +178,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--speaker-device", default="cuda:1")
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--sampling-steps", type=int, default=20)
-    ap.add_argument("--cfg-scale", type=float, default=1.5)
+    ap.add_argument("--cfg-scale", type=float, default=2.5, help="speaker CFG scale")
+    ap.add_argument("--semantic-cfg-scale", type=float, default=2.0)
     ap.add_argument("--seed", type=int, default=20260715)
     ap.add_argument("--poll-seconds", type=float, default=60.0)
     ap.add_argument("--max-scans", type=int, default=0, help="0 means no limit in watch mode")
@@ -221,7 +222,7 @@ def validate_fixed_conditions(args: argparse.Namespace) -> dict[str, Any]:
     if len(rows) != 20 or len(set(case_ids)) != 20 or any(not item for item in case_ids):
         raise ValueError("fixed quick20 must contain exactly 20 unique case IDs")
     if any(str(row.get("mode") or "") != "no_text" for row in rows):
-        raise ValueError("Batch-46 quick20 must be no_text-only")
+        raise ValueError("Batch-47 quick20 must be no_text-only")
 
     if not args.semantic_manifest.is_file():
         raise FileNotFoundError(args.semantic_manifest)
@@ -309,7 +310,7 @@ def ready_marker(args: argparse.Namespace, step: int) -> tuple[Path, dict[str, A
 
 
 def run_id(step: int, variant: Variant) -> str:
-    return f"codecVC-ver3-1-batch46-step{step:06d}-{variant.key.replace('_', '-')}"
+    return f"codecVC-ver3-1-batch47-step{step:06d}-{variant.key.replace('_', '-')}"
 
 
 def variant_dir(args: argparse.Namespace, step: int, variant: Variant) -> Path:
@@ -346,6 +347,7 @@ def command_plan(args: argparse.Namespace, checkpoint: Path, step: int, variant:
         "--batch-size", str(args.batch_size),
         "--sampling-steps", str(args.sampling_steps),
         "--cfg-scale", str(args.cfg_scale),
+        "--semantic-cfg-scale", str(args.semantic_cfg_scale),
         "--zq-channel-stats", str(args.zq_channel_stats),
         "--seed", str(args.seed),
         "--device", str(args.inference_device),
@@ -394,7 +396,7 @@ def command_plan(args: argparse.Namespace, checkpoint: Path, step: int, variant:
         "--summary-md", str(directory / "SUMMARY.md"),
         "--summary-json", str(summary_json),
         "--run-id", rid,
-        "--run-label", f"Batch-46 step {step} {variant.label}",
+        "--run-label", f"Batch-47 step {step} {variant.label}",
         "--model-path", str(checkpoint),
     ]
     speaker = [
@@ -537,6 +539,7 @@ def load_variant_metrics(args: argparse.Namespace, step: int, variant: Variant) 
         "label": variant.label,
         "weights": "ema" if variant.use_ema else "raw",
         "cfg_scale": float(args.cfg_scale),
+        "semantic_cfg_scale": float(args.semantic_cfg_scale),
         "n": int(run.get("n", 0)),
         "sim_ref": sim_ref,
         "sim_src": sim_src,
@@ -625,10 +628,12 @@ def run_variant(
         raise ValueError(
             f"weight lane mismatch for {variant.key}: using_ema={evaluator.get('using_ema')}"
         )
-    if abs(float(evaluator.get("cfg_scale")) - float(args.cfg_scale)) > 1.0e-9:
+    if abs(float(evaluator.get("speaker_cfg_scale", evaluator.get("cfg_scale"))) - float(args.cfg_scale)) > 1.0e-9:
         raise ValueError("CFG scale mismatch in evaluator completion")
+    if abs(float(evaluator.get("semantic_cfg_scale", 0.0)) - float(args.semantic_cfg_scale)) > 1.0e-9:
+        raise ValueError("semantic CFG scale mismatch in evaluator completion")
     payload = {
-        "schema": "ver3_1_batch46_local_quick20_completion_v1",
+        "schema": "ver3_1_batch47_local_quick20_completion_v1",
         "status": "completed",
         "completed_at_utc": utc_now(),
         "task_name": args.task_name,
@@ -659,7 +664,7 @@ def write_aggregate(args: argparse.Namespace) -> None:
     rows = completed_metrics(args)
     args.output_root.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema": "ver3_1_batch46_local_quick20_aggregate_v1",
+        "schema": "ver3_1_batch47_local_quick20_aggregate_v1",
         "updated_at_utc": utc_now(),
         "task_name": args.task_name,
         "checkpoint_root": str(args.checkpoint_root),
@@ -671,7 +676,7 @@ def write_aggregate(args: argparse.Namespace) -> None:
     atomic_json(args.output_root / "summary.json", payload)
     with (args.output_root / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         fields = [
-            "step", "variant", "weights", "cfg_scale", "n", "sim_ref", "sim_src",
+            "step", "variant", "weights", "cfg_scale", "semantic_cfg_scale", "n", "sim_ref", "sim_src",
             "margin", "cer", "fail_rate", "loss_mean", "loss_last",
             "loss_slope_per_100", "loss_direction",
         ]
@@ -684,6 +689,7 @@ def write_aggregate(args: argparse.Namespace) -> None:
                 "variant": row.get("variant"),
                 "weights": row.get("weights"),
                 "cfg_scale": row.get("cfg_scale"),
+                "semantic_cfg_scale": row.get("semantic_cfg_scale"),
                 "n": row.get("n"),
                 "sim_ref": row.get("sim_ref"),
                 "sim_src": row.get("sim_src"),
@@ -696,10 +702,10 @@ def write_aggregate(args: argparse.Namespace) -> None:
                 "loss_direction": trend.get("direction"),
             })
     lines = [
-        "# Batch-46 local quick20",
+        "# Batch-47 local quick20",
         "",
         f"Task: `{args.task_name}`  ",
-        "Protocol: fixed 20 no_text cases, Euler-20, speaker CFG 1.5, primary EMA + raw diagnostic.",
+        "Protocol: fixed 20 no_text cases, Euler-20, speaker CFG 2.5 + semantic CFG 2.0, primary EMA + raw diagnostic.",
         "",
         "| Step | Lane | SIM(ref) | SIM(src) | Margin | CER | Fail | Loss mean | Loss slope/100 | Trend |",
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|---|",
@@ -742,7 +748,7 @@ def evaluate_step500_gate(args: argparse.Namespace) -> str:
         return "pass"
     if not raw_all_fail:
         payload = {
-            "schema": "ver3_1_batch46_step500_ema_lag_warning_v1",
+        "schema": "ver3_1_batch47_step500_ema_lag_warning_v1",
             "status": "ema_lag_warning",
             "created_at_utc": utc_now(),
             "reason": "primary EMA+CFG1.5 is 100% fail but raw+CFG1.5 is not",
@@ -756,10 +762,10 @@ def evaluate_step500_gate(args: argparse.Namespace) -> str:
         atomic_json(args.output_root / "EMA_LAG_WARNING_STEP500.json", payload)
         return "ema_lag_warning"
     payload = {
-        "schema": "ver3_1_batch46_step500_red_flag_v1",
+        "schema": "ver3_1_batch47_step500_red_flag_v1",
         "status": "red_flag",
         "created_at_utc": utc_now(),
-        "reason": "both EMA+CFG1.5 and raw+CFG1.5 fixed no_text quick20 have 100% fail at step 500",
+        "reason": "both EMA+speakerCFG2.5+semanticCFG2.0 and raw lanes have 100% fail at step 500",
         "action": "stop this evaluation watcher and report; training is not stopped or signalled",
         "task_name": args.task_name,
         "step": 500,
@@ -796,7 +802,7 @@ def plan_payload(args: argparse.Namespace, conditions: dict[str, Any]) -> dict[s
             ],
         })
     return {
-        "schema": "ver3_1_batch46_local_quick20_plan_v1",
+        "schema": "ver3_1_batch47_local_quick20_plan_v1",
         "generated_at_utc": utc_now(),
         "action": args.action,
         "dry_run": args.action == "plan",
@@ -825,7 +831,7 @@ def acquire_lock(args: argparse.Namespace):
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         handle.close()
-        raise RuntimeError(f"another Batch-46 local quick20 watcher holds {path}") from exc
+        raise RuntimeError(f"another Batch-47 local quick20 watcher holds {path}") from exc
     handle.seek(0)
     handle.truncate()
     handle.write(json.dumps({"pid": os.getpid(), "started_at_utc": utc_now(), "task": args.task_name}) + "\n")
@@ -835,11 +841,11 @@ def acquire_lock(args: argparse.Namespace):
 
 def scan_once(args: argparse.Namespace) -> str:
     if red_flag_path(args).is_file() and not args.continue_after_step500_red_flag:
-        print(f"[batch46-local-quick20] red flag already exists: {red_flag_path(args)}", flush=True)
+        print(f"[batch47-local-quick20] red flag already exists: {red_flag_path(args)}", flush=True)
         return "red_flag"
     if not args.zq_channel_stats.is_file():
         print(
-            f"[batch46-local-quick20] waiting for canonical zq stats {args.zq_channel_stats}",
+            f"[batch47-local-quick20] waiting for canonical zq stats {args.zq_channel_stats}",
             flush=True,
         )
         return "waiting"
@@ -849,21 +855,21 @@ def scan_once(args: argparse.Namespace) -> str:
         ready = ready_marker(args, step)
         if ready is None:
             print(
-                f"[batch46-local-quick20] waiting for atomic ready marker "
+                f"[batch47-local-quick20] waiting for atomic ready marker "
                 f"{args.checkpoint_root / f'step-{step:06d}.ready.json'}",
                 flush=True,
             )
             return "waiting"
         marker_path, marker, checkpoint = ready
-        print(f"[batch46-local-quick20] step={step} checkpoint={checkpoint}", flush=True)
+        print(f"[batch47-local-quick20] step={step} checkpoint={checkpoint}", flush=True)
         for variant in VARIANTS:
             if variant_completion(args, step, variant).is_file():
                 continue
-            print(f"[batch46-local-quick20] run {variant.label}", flush=True)
+            print(f"[batch47-local-quick20] run {variant.label}", flush=True)
             metrics = run_variant(args, marker_path, marker, checkpoint, step, variant)
             trend = metrics.get("loss_trend") or {}
             print(
-                "[batch46-local-quick20] "
+                "[batch47-local-quick20] "
                 f"step={step} weights={metrics['weights']} "
                 f"sim_ref={float(metrics['sim_ref']):.4f} "
                 f"sim_src={float(metrics['sim_src']):.4f} "
@@ -880,13 +886,13 @@ def scan_once(args: argparse.Namespace) -> str:
             gate = evaluate_step500_gate(args)
             if gate == "ema_lag_warning":
                 print(
-                    "[batch46-local-quick20] EMA_LAG_WARNING: step500 EMA fail=100% "
+                    "[batch47-local-quick20] EMA_LAG_WARNING: step500 EMA fail=100% "
                     "but raw<100%; watcher continues",
                     flush=True,
                 )
             if gate == "hard_red_flag" and not args.continue_after_step500_red_flag:
                 print(
-                    "[batch46-local-quick20] HARD RED FLAG: step500 EMA and raw both fail=100%; "
+                    "[batch47-local-quick20] HARD RED FLAG: step500 EMA and raw both fail=100%; "
                     "watcher stops itself, training remains untouched",
                     flush=True,
                 )
@@ -916,13 +922,13 @@ def main() -> int:
         atomic_json(args.record_root / "plan.json", plan)
         if args.action == "once":
             state = scan_once(args)
-            print(f"[batch46-local-quick20] state={state}", flush=True)
+            print(f"[batch47-local-quick20] state={state}", flush=True)
             return 0
         scans = 0
         while True:
             scans += 1
             state = scan_once(args)
-            print(f"[batch46-local-quick20] scan={scans} state={state}", flush=True)
+            print(f"[batch47-local-quick20] scan={scans} state={state}", flush=True)
             if state in {"complete", "red_flag"}:
                 return 0
             if args.max_scans > 0 and scans >= args.max_scans:

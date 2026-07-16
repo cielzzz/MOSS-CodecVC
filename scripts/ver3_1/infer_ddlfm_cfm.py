@@ -50,6 +50,34 @@ def combine_cfg_velocity(
     return velocity_uncond + float(scale) * (velocity_cond - velocity_uncond)
 
 
+def combine_dual_cfg_velocity(
+    velocity_cond: torch.Tensor,
+    velocity_speaker: torch.Tensor,
+    velocity_semantic: torch.Tensor,
+    speaker_scale: float,
+    semantic_scale: float,
+) -> torch.Tensor:
+    """Independent CFG anchored at the fully conditioned velocity.
+
+    ``velocity_cond`` is v11 (speaker + semantic), ``velocity_speaker`` is
+    v10 (speaker only) and ``velocity_semantic`` is v01 (semantic only).  The
+    anchored form is identity-preserving at scale (1,1): it returns v11 rather
+    than the additive ``v00 + ...`` approximation, which would silently drop
+    the learned interaction term.
+    """
+
+    if not (velocity_cond.shape == velocity_speaker.shape == velocity_semantic.shape):
+        raise ValueError("dual CFG velocity tensors must have identical shapes")
+    for name, value in (("speaker_scale", speaker_scale), ("semantic_scale", semantic_scale)):
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    return (
+        velocity_cond
+        + (float(speaker_scale) - 1.0) * (velocity_cond - velocity_semantic)
+        + (float(semantic_scale) - 1.0) * (velocity_cond - velocity_speaker)
+    )
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", required=True)
@@ -69,6 +97,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Default: 1.5 for CFG-trained checkpoints, otherwise 1.0 for legacy checkpoints.",
+    )
+    ap.add_argument(
+        "--speaker-cfg-scale",
+        type=float,
+        default=None,
+        help="Batch-47 speaker CFG; defaults to checkpoint speaker_cfg_scale/cfg_scale.",
+    )
+    ap.add_argument(
+        "--semantic-cfg-scale",
+        type=float,
+        default=None,
+        help="Batch-47 semantic CFG; zero preserves legacy speaker-only CFG.",
     )
     ap.add_argument(
         "--zq-channel-stats",
@@ -112,6 +152,9 @@ def load_checkpoint(
 ) -> tuple[DDLFMTrainModule, dict[str, Any]]:
     payload = torch.load(str(path), map_location="cpu", weights_only=False)
     cfg = dict(payload.get("config") or {})
+    state_probe = payload.get("ema_model") or payload.get("model") or {}
+    prompt_value = state_probe.get("decoder.speaker_prompt") if isinstance(state_probe, dict) else None
+    inferred_prompt_tokens = int(prompt_value.shape[1]) if torch.is_tensor(prompt_value) and prompt_value.ndim == 3 else 4
     args = SimpleNamespace(
         latent_dim=int(cfg.get("latent_dim", 768)),
         semantic_dim=int(cfg.get("semantic_dim", 512)),
@@ -121,6 +164,9 @@ def load_checkpoint(
         num_heads=int(cfg.get("num_heads", 12)),
         ffn_size=int(cfg.get("ffn_size", 3072)),
         cross_gate_init=float(cfg.get("cross_gate_init", 0.0)),
+        num_speaker_prompt_tokens=int(cfg.get("num_speaker_prompt_tokens", inferred_prompt_tokens)),
+        speaker_condition_scale=float(cfg.get("speaker_condition_scale", 4.0)),
+        speaker_input_scale=float(cfg.get("speaker_input_scale", 1.0)),
         text_vocab_size=int(cfg.get("text_vocab_size", 8001)),
         text_padding_id=int(cfg.get("text_padding_id", 0)),
         smoke_small_model=bool(cfg.get("smoke_small_model", False)),
@@ -130,7 +176,10 @@ def load_checkpoint(
     using_ema = state is not None
     if state is None:
         state = payload["model"]
-    module.load_state_dict(state, strict=True)
+    # Batch-47 adds AdaLN branches and multi-token prompts.  Loading an older
+    # Batch-45/46 checkpoint remains useful for diagnostics: preserve all
+    # matching legacy weights and leave only the new branches initialized.
+    module.load_state_dict(state, strict=False)
     cfg["_checkpoint_has_ema"] = payload.get("ema_model") is not None
     cfg["_checkpoint_using_ema"] = bool(using_ema)
     cfg["_checkpoint_ema_metadata"] = dict(payload.get("ema") or {})
@@ -148,6 +197,7 @@ def sample_velocity(
     modality: int,
     steps: int,
     cfg_scale: float,
+    semantic_cfg_scale: float = 0.0,
     device: torch.device,
     seed: int,
 ) -> torch.Tensor:
@@ -164,31 +214,61 @@ def sample_velocity(
     if not math.isfinite(float(cfg_scale)) or float(cfg_scale) < 0.0:
         raise ValueError("cfg_scale must be finite and non-negative")
     zero_speaker = torch.zeros_like(speaker)
+    zero_semantic = torch.zeros_like(semantic)
+    zero_semantic_mask = torch.zeros_like(semantic_mask, dtype=torch.bool)
     for index in range(int(steps)):
         t_value = float(index) / float(steps)
         t = torch.full((1,), t_value, device=device)
-        velocity_cond = module.decoder(
-            x,
-            t,
-            semantic,
-            speaker,
-            target_mask=target_mask,
-            semantic_mask=semantic_mask,
-            semantic_modality=torch.tensor([int(modality)], device=device),
-        ).velocity
-        if float(cfg_scale) == 1.0:
-            velocity = velocity_cond
+        modality_tensor = torch.tensor([int(modality)], device=device)
+        if float(semantic_cfg_scale) > 0.0:
+            velocity_cond = module.decoder(
+                x, t, semantic, speaker,
+                target_mask=target_mask,
+                semantic_mask=semantic_mask,
+                semantic_modality=modality_tensor,
+            ).velocity
+            velocity_speaker = module.decoder(
+                x, t, zero_semantic, speaker,
+                target_mask=target_mask,
+                semantic_mask=zero_semantic_mask,
+                semantic_modality=modality_tensor,
+            ).velocity
+            velocity_semantic = module.decoder(
+                x, t, semantic, zero_speaker,
+                target_mask=target_mask,
+                semantic_mask=semantic_mask,
+                semantic_modality=modality_tensor,
+            ).velocity
+            velocity = combine_dual_cfg_velocity(
+                velocity_cond,
+                velocity_speaker,
+                velocity_semantic,
+                float(cfg_scale),
+                float(semantic_cfg_scale),
+            )
         else:
-            velocity_uncond = module.decoder(
+            velocity_cond = module.decoder(
                 x,
                 t,
                 semantic,
-                zero_speaker,
+                speaker,
                 target_mask=target_mask,
                 semantic_mask=semantic_mask,
-                semantic_modality=torch.tensor([int(modality)], device=device),
+                semantic_modality=modality_tensor,
             ).velocity
-            velocity = combine_cfg_velocity(velocity_cond, velocity_uncond, float(cfg_scale))
+            if float(cfg_scale) == 1.0:
+                velocity = velocity_cond
+            else:
+                velocity_uncond = module.decoder(
+                    x,
+                    t,
+                    semantic,
+                    zero_speaker,
+                    target_mask=target_mask,
+                    semantic_mask=semantic_mask,
+                    semantic_modality=modality_tensor,
+                ).velocity
+                velocity = combine_cfg_velocity(velocity_cond, velocity_uncond, float(cfg_scale))
         x = x + velocity / float(steps)
     return x
 
@@ -205,6 +285,16 @@ def main() -> int:
         float(args.cfg_scale)
         if args.cfg_scale is not None
         else (1.5 if float(cfg.get("speaker_dropout", 0.0)) > 0.0 else 1.0)
+    )
+    speaker_cfg_scale = (
+        float(args.speaker_cfg_scale)
+        if args.speaker_cfg_scale is not None
+        else float(cfg.get("speaker_cfg_scale", cfg_scale))
+    )
+    semantic_cfg_scale = (
+        float(args.semantic_cfg_scale)
+        if args.semantic_cfg_scale is not None
+        else float(cfg.get("semantic_cfg_scale", 0.0))
     )
     using_ema = bool(cfg.get("_checkpoint_using_ema", False))
     normalization_enabled = bool(cfg.get("zq_normalization_enabled", False))
@@ -237,6 +327,8 @@ def main() -> int:
             "speaker_shape": list(speaker.shape),
             "parameters": module.decoder.parameter_count(),
             "cfg_scale": cfg_scale,
+            "speaker_cfg_scale": speaker_cfg_scale,
+            "semantic_cfg_scale": semantic_cfg_scale,
             "using_ema": using_ema,
             "zq_normalization_enabled": normalization_enabled,
         }, ensure_ascii=False))
@@ -249,7 +341,8 @@ def main() -> int:
         speaker=speaker,
         modality=0 if args.mode == "no_text" else 1,
         steps=int(args.sampling_steps),
-        cfg_scale=cfg_scale,
+        cfg_scale=speaker_cfg_scale,
+        semantic_cfg_scale=semantic_cfg_scale,
         device=device,
         seed=int(args.seed),
     )
@@ -295,6 +388,8 @@ def main() -> int:
         "target_frames": target_frames,
         "sampling_steps": int(args.sampling_steps),
         "cfg_scale": cfg_scale,
+        "speaker_cfg_scale": speaker_cfg_scale,
+        "semantic_cfg_scale": semantic_cfg_scale,
         "using_ema": using_ema,
         "zq_normalization_enabled": normalization_enabled,
         "zq_channel_stats": str(stats_path) if stats_path is not None else None,

@@ -100,7 +100,16 @@ def _apply_rotary_position_embedding(
 
 
 class DDLFMAdaLNBlock(nn.Module):
-    """Self-attention + semantic cross-attention + FFN with AdaLN gates."""
+    """Self-attention + semantic cross-attention + FFN with two AdaLN paths.
+
+    Batch-47 keeps the historical ``condition`` projection as a compatibility
+    surface for the cross branch, and adds independent ``adaln_self`` and
+    ``adaln_ffn`` projections.  The latter are the two explicit AdaLN paths
+    requested by Fix E.  Their final biases initialize the *actual*
+    multiplicative scale at one (the residual ``scale`` parameter is zero) and
+    shifts at zero.  Self/FFN residuals are active at unit strength; the
+    condition gate only controls how much speaker/time modulation is applied.
+    """
 
     def __init__(
         self,
@@ -154,6 +163,29 @@ class DDLFMAdaLNBlock(nn.Module):
             self.condition[-1].bias[5 * hidden_size : 6 * hidden_size].fill_(
                 self.cross_gate_init
             )
+
+        # Independent AdaLN projections before self-attention and FFN.  The
+        # zero residual-scale bias means ``1 + scale == 1`` at initialization;
+        # this is the numerically stable interpretation of scale(init)=1.0.
+        self.adaln_self = nn.Sequential(
+            nn.LayerNorm(int(condition_size)),
+            nn.Linear(int(condition_size), hidden_size * 3),
+        )
+        self.adaln_ffn = nn.Sequential(
+            nn.LayerNorm(int(condition_size)),
+            nn.Linear(int(condition_size), hidden_size * 3),
+        )
+        for projection in (self.adaln_self[-1], self.adaln_ffn[-1]):
+            nn.init.normal_(projection.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(projection.bias)
+        # Speaker-only FiLM/AdaLN branch.  It bypasses the time+speaker sum so
+        # LayerNorm on the shared condition cannot wash out speaker identity.
+        self.speaker_adaln = nn.Sequential(
+            nn.LayerNorm(int(condition_size)),
+            nn.Linear(int(condition_size), hidden_size * 6),
+        )
+        nn.init.normal_(self.speaker_adaln[-1].weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.speaker_adaln[-1].bias)
 
     def _cross_attention_with_rope(
         self,
@@ -224,15 +256,39 @@ class DDLFMAdaLNBlock(nn.Module):
         target_positions: torch.Tensor | None = None,
         semantic_positions: torch.Tensor | None = None,
         condition_gate_scale: float = 1.0,
+        speaker_condition: torch.Tensor | None = None,
+        speaker_condition_scale: float = 1.0,
     ) -> torch.Tensor:
+        gate_scale = float(condition_gate_scale)
+        if not math.isfinite(gate_scale) or gate_scale < 0.0:
+            raise ValueError("condition_gate_scale must be finite and non-negative")
         params = self.condition(condition).chunk(9, dim=-1)
         shift_self, scale_self, gate_self = params[0:3]
         shift_cross, scale_cross, gate_cross = params[3:6]
         shift_ffn, scale_ffn, gate_ffn = params[6:9]
-        gate_scale = float(condition_gate_scale)
-        if not math.isfinite(gate_scale) or gate_scale < 0.0:
-            raise ValueError("condition_gate_scale must be finite and non-negative")
-        gate_cross = gate_cross * gate_scale
+        self_extra = self.adaln_self(condition).chunk(3, dim=-1)
+        ffn_extra = self.adaln_ffn(condition).chunk(3, dim=-1)
+        if speaker_condition is None:
+            speaker_extra = [torch.zeros_like(self_extra[0]) for _ in range(6)]
+        else:
+            if speaker_condition.shape != condition.shape:
+                raise ValueError("speaker_condition must match condition shape")
+            speaker_scale = float(speaker_condition_scale)
+            if not math.isfinite(speaker_scale) or speaker_scale < 0.0:
+                raise ValueError("speaker_condition_scale must be finite and non-negative")
+            speaker_extra = [value * speaker_scale for value in self.speaker_adaln(speaker_condition).chunk(6, dim=-1)]
+        # Each extra AdaLN has a shift/scale pair for the attention/FFN input;
+        # the second pair is a residual-gate correction.  At gate_scale=0 all
+        # conditional effects vanish, which is important for CFG baselines.
+        shift_self = gate_scale * (shift_self + self_extra[0] + speaker_extra[0])
+        scale_self = gate_scale * (scale_self + self_extra[1] + speaker_extra[1])
+        gate_self = gate_scale * (gate_self + self_extra[2] + speaker_extra[2])
+        shift_cross = gate_scale * shift_cross
+        scale_cross = gate_scale * scale_cross
+        gate_cross = gate_scale * gate_cross
+        shift_ffn = gate_scale * (shift_ffn + ffn_extra[0] + speaker_extra[3])
+        scale_ffn = gate_scale * (scale_ffn + ffn_extra[1] + speaker_extra[4])
+        gate_ffn = gate_scale * (gate_ffn + ffn_extra[2] + speaker_extra[5])
 
         h = _modulate(self.norm_self(x), shift_self, scale_self)
         h = self.self_attn(
@@ -242,7 +298,7 @@ class DDLFMAdaLNBlock(nn.Module):
             key_padding_mask=~target_mask,
             need_weights=False,
         )[0]
-        x = x + gate_self.unsqueeze(1) * h
+        x = x + (1.0 + gate_self).unsqueeze(1) * h
 
         h = _modulate(self.norm_cross(x), shift_cross, scale_cross)
         if target_positions is None:
@@ -259,7 +315,7 @@ class DDLFMAdaLNBlock(nn.Module):
         x = x + gate_cross.unsqueeze(1) * h
 
         h = _modulate(self.norm_ffn(x), shift_ffn, scale_ffn)
-        x = x + gate_ffn.unsqueeze(1) * self.ffn(h)
+        x = x + (1.0 + gate_ffn).unsqueeze(1) * self.ffn(h)
         return x.masked_fill(~target_mask.unsqueeze(-1), 0.0)
 
 
@@ -285,6 +341,9 @@ class DDLFMDecoder(nn.Module):
         num_modalities: int = 2,
         rope_base: float = 10000.0,
         cross_gate_init: float = 0.0,
+        num_speaker_prompt_tokens: int = 4,
+        speaker_condition_scale: float = 4.0,
+        speaker_input_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -292,8 +351,17 @@ class DDLFMDecoder(nn.Module):
         self.speaker_dim = int(speaker_dim)
         self.hidden_size = int(hidden_size)
         self.num_modalities = int(num_modalities)
+        self.num_speaker_prompt_tokens = int(num_speaker_prompt_tokens)
+        self.speaker_condition_scale = float(speaker_condition_scale)
+        self.speaker_input_scale = float(speaker_input_scale)
         if self.num_modalities < 1:
             raise ValueError("num_modalities must be positive")
+        if self.num_speaker_prompt_tokens < 1:
+            raise ValueError("num_speaker_prompt_tokens must be positive")
+        if not math.isfinite(self.speaker_condition_scale) or self.speaker_condition_scale < 0.0:
+            raise ValueError("speaker_condition_scale must be finite and non-negative")
+        if not math.isfinite(self.speaker_input_scale) or self.speaker_input_scale < 0.0:
+            raise ValueError("speaker_input_scale must be finite and non-negative")
 
         self.input_proj = nn.Linear(self.latent_dim, self.hidden_size)
         self.output_norm = nn.LayerNorm(self.hidden_size)
@@ -307,13 +375,37 @@ class DDLFMDecoder(nn.Module):
             nn.SiLU(),
             nn.Linear(self.hidden_size, self.hidden_size),
         )
+        # Make zero-speaker CFG truly unconditional: all affine biases on the
+        # speaker path start at zero, so a zero embedding produces zero.
+        for module in self.speaker_proj:
+            if isinstance(module, nn.Linear):
+                nn.init.zeros_(module.bias)
         self.time_proj = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size * 4),
             nn.SiLU(),
             nn.Linear(self.hidden_size * 4, self.hidden_size),
         )
+        self.speaker_input_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        nn.init.normal_(self.speaker_input_proj.weight, mean=0.0, std=0.05)
+        nn.init.zeros_(self.speaker_input_proj.bias)
         self.modality_embedding = nn.Embedding(self.num_modalities, self.semantic_dim)
-        self.speaker_prompt = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
+        self.speaker_prompt = nn.Parameter(
+            torch.zeros(1, self.num_speaker_prompt_tokens, self.hidden_size)
+        )
+        # Four independent speaker-to-prompt MLPs.  Their final biases are
+        # zero so the zero-speaker branch has no hidden speaker offset.
+        self.speaker_prompt_mlps = nn.ModuleList()
+        for _ in range(self.num_speaker_prompt_tokens):
+            mlp = nn.Sequential(
+                nn.LayerNorm(self.speaker_dim),
+                nn.Linear(self.speaker_dim, self.hidden_size),
+                nn.SiLU(),
+                nn.Linear(self.hidden_size, self.hidden_size),
+            )
+            for module in mlp:
+                if isinstance(module, nn.Linear):
+                    nn.init.zeros_(module.bias)
+            self.speaker_prompt_mlps.append(mlp)
         self.layers = nn.ModuleList(
             [
                 DDLFMAdaLNBlock(
@@ -371,6 +463,15 @@ class DDLFMDecoder(nn.Module):
         layer_rows: list[dict[str, object]] = []
         for layer_index, layer in enumerate(self.layers):
             params = layer.condition(condition).chunk(9, dim=-1)
+            self_extra = layer.adaln_self(condition).chunk(3, dim=-1)
+            ffn_extra = layer.adaln_ffn(condition).chunk(3, dim=-1)
+            params = list(params)
+            params[0] = params[0] + float(gate_scale) * self_extra[0]
+            params[1] = params[1] + float(gate_scale) * self_extra[1]
+            params[2] = params[2] + float(gate_scale) * self_extra[2]
+            params[6] = params[6] + float(gate_scale) * ffn_extra[0]
+            params[7] = params[7] + float(gate_scale) * ffn_extra[1]
+            params[8] = params[8] + float(gate_scale) * ffn_extra[2]
             row: dict[str, object] = {"layer": int(layer_index)}
             for branch_index, branch_name in enumerate(("self", "cross", "ffn")):
                 shift, scale, gate = params[branch_index * 3 : branch_index * 3 + 3]
@@ -462,8 +563,13 @@ class DDLFMDecoder(nn.Module):
                 raise ValueError("semantic_modality contains an invalid modality id")
 
         pos = _sinusoidal_time_embedding(t, self.hidden_size).to(dtype=x_t.dtype)
-        condition = self.time_proj(pos) + self.speaker_proj(speaker.to(dtype=x_t.dtype))
+        time_condition = self.time_proj(pos)
+        speaker_condition = self.speaker_proj(speaker.to(dtype=x_t.dtype))
+        condition = time_condition + speaker_condition
         x = self.input_proj(x_t)
+        x = x + float(condition_gate_scale) * self.speaker_input_scale * self.speaker_input_proj(
+            speaker_condition
+        ).unsqueeze(1)
         # Dynamic sinusoidal frame positions avoid a fixed maximum sequence length.
         frame_pos = _sinusoidal_time_embedding(
             torch.arange(target_len, device=x.device, dtype=torch.float32),
@@ -474,16 +580,44 @@ class DDLFMDecoder(nn.Module):
         semantic = semantic.to(dtype=x.dtype)
         semantic = semantic + self.modality_embedding(semantic_modality).unsqueeze(1).to(dtype=x.dtype)
         semantic = self.semantic_proj(semantic).masked_fill(~semantic_mask.unsqueeze(-1), 0.0)
-        speaker_token = self.speaker_proj(speaker.to(dtype=x.dtype)).unsqueeze(1) + self.speaker_prompt.to(dtype=x.dtype)
-        # Keep the speaker prompt at the fixed position zero, independent of
-        # semantic duration and batch padding.  Semantic frames occupy
-        # positions 1..S, so a short row is invariant to longer batch peers.
+        prompt_tokens = []
+        for index, mlp in enumerate(self.speaker_prompt_mlps):
+            prompt = mlp(speaker.to(dtype=x.dtype)) + self.speaker_prompt[:, index, :].to(dtype=x.dtype)
+            prompt_tokens.append(prompt.unsqueeze(1))
+        speaker_token = torch.cat(prompt_tokens, dim=1)
+        # condition_gate_scale=0 is the exact no-condition control used by
+        # semantic/speaker CFG diagnostics.
+        speaker_token = speaker_token * float(condition_gate_scale)
+        # Keep the speaker prompts as a fixed K/V prefix, independent of
+        # semantic duration and batch padding.  Their RoPE positions are
+        # negative; semantic frames retain positions 0..S-1.
         semantic = torch.cat([speaker_token, semantic], dim=1)
         semantic_mask = torch.cat(
-            [torch.ones(batch, 1, dtype=torch.bool, device=x.device), semantic_mask], dim=1
+            [
+                torch.ones(
+                    batch,
+                    self.num_speaker_prompt_tokens,
+                    dtype=torch.bool,
+                    device=x.device,
+                ),
+                semantic_mask,
+            ],
+            dim=1,
         )
         target_positions = torch.arange(target_len, device=x.device)
-        semantic_positions = torch.arange(semantic_len + 1, device=x.device)
+        # Keep semantic frame positions at 0..S-1; prompt tokens use negative
+        # prefix positions so adding four prompts does not shift every BNF
+        # frame by 320 ms in the RoPE coordinate system.
+        prompt_positions = torch.arange(
+            -self.num_speaker_prompt_tokens,
+            0,
+            device=x.device,
+            dtype=torch.long,
+        )
+        semantic_positions = torch.cat(
+            [prompt_positions, torch.arange(semantic_len, device=x.device)],
+            dim=0,
+        )
         for layer in self.layers:
             x = layer(
                 x,
@@ -494,6 +628,8 @@ class DDLFMDecoder(nn.Module):
                 target_positions=target_positions,
                 semantic_positions=semantic_positions,
                 condition_gate_scale=condition_gate_scale,
+                speaker_condition=speaker_condition,
+                speaker_condition_scale=self.speaker_condition_scale,
             )
         velocity = self.output_proj(self.output_norm(x)).masked_fill(~target_mask.unsqueeze(-1), 0.0)
         return DDLFMOutput(velocity=velocity)

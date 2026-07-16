@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Batch-46: ver3.1 DDLFM no_text-only 3k probe on the sole approved QZ node.
+# Batch-47: aggressive endpoint-conditioned ver3.1 DDLFM no_text-only probe.
 #
 # Safety contract:
 #   * dry-run is the default and never calls qzcli;
 #   * live submission additionally requires a clean, tagged branch and an
-#     explicit ALLOW_CODECVC_BATCH46_SUBMIT=1 guard;
+#     explicit ALLOW_CODECVC_BATCH47_SUBMIT=1 guard;
 #   * critical model/data/resource settings are constants, not casual CLI
 #     overrides, so the submitted experiment remains the preregistered arm.
 set -Eeuo pipefail
@@ -30,7 +30,7 @@ SHM_GI="${SHM_GI:-1200}"
 PRIORITY="${PRIORITY:-10}"
 DRY_RUN="${DRY_RUN:-1}"
 
-# The exact Batch-46 training arm.  These are intentionally not environment
+# The exact Batch-47 training arm.  These are intentionally not environment
 # overrides: changing one creates a different experiment and needs a new
 # wrapper/name.
 STEPS=3000
@@ -54,28 +54,38 @@ NUM_LAYERS=12
 NUM_HEADS=12
 FFN_SIZE=3072
 TRAIN_MODE="no_text"
-T_SAMPLING="logit_normal"
+T_SAMPLING="shift_low"
 T_LOGIT_MU="0.0"
 T_LOGIT_SIGMA="1.0"
+T_SHIFT_POWER="4.0"
+T_MODE_SHIFT_M="3.0"
 LOSS_WEIGHTING="low_t"
-LOSS_WEIGHT_EPS="0.05"
-LOSS_WEIGHT_CAP="5.0"
-SPEAKER_DROPOUT="0.10"
+LOSS_WEIGHT_EPS="0.02"
+LOSS_WEIGHT_CAP="25.0"
+SPEAKER_DROPOUT="0.25"
+SEMANTIC_DROPOUT="0.15"
+AUX_LOSS_WEIGHT="1.0"
+AUX_WARMUP_STEPS=500
 EMA_DECAY="0.9999"
 EMA_WARMUP=1
 CROSS_GATE_INIT="0.05"
 GATE_WARMUP_STEPS=500
 GATE_WARMUP_START="0.05"
 EVAL_CFG_SCALE="1.5"
+EVAL_SPEAKER_CFG_SCALE="2.5"
+EVAL_SEMANTIC_CFG_SCALE="2.0"
 EVAL_USE_EMA=1
+NUM_SPEAKER_PROMPT_TOKENS=4
+SPEAKER_CONDITION_SCALE="4.0"
+SPEAKER_INPUT_SCALE="1.0"
 
-REQUIRED_BRANCH="feat/ver3_1_batch46_fixes"
-REQUIRED_READY_TAG="ver3_1_batch46_fixes_ready"
-BATCH_ID="${BATCH_ID:-codecVC-ver3-1-batch46-ddlfm-no-text-3k-probe-20260716}"
+REQUIRED_BRANCH="feat/ver3_1_batch47_endpoint_rescue"
+REQUIRED_READY_TAG="ver3_1_batch47_fixes_ready"
+BATCH_ID="${BATCH_ID:-codecVC-ver3-1-batch47-ddlfm-no-text-3k-probe-20260716}"
 JOB_NAME="${JOB_NAME:-$BATCH_ID}"
 RECORD_ROOT="${RECORD_ROOT:-$ROOT/trainset/qz_jobs/$BATCH_ID}"
 SNAPSHOT_ROOT="$RECORD_ROOT/record_snapshot"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT/outputs/ver3_1_batch46_ddlfm_no_text_probe_20260716}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT/outputs/ver3_1_batch47_ddlfm_no_text_probe_20260716}"
 
 INDEX="$ROOT/prepared/ddlfm_v1_index.jsonl"
 INDEX_SUMMARY="$ROOT/prepared/ddlfm_v1_index.summary.json"
@@ -89,7 +99,7 @@ CHANNEL_STATS_AUDIT="$ROOT/prepared/zq_targets_v1/channel_stats.json"
 EXPECTED_ZQ_FRAMES=35098460
 SEMANTIC_COMPLETION="$ROOT/prepared/semantic_v1_v3_1_step3_no_text_20260715/COMPLETED.json"
 NORMALIZATION_SANITY_REPORT="$ROOT/testset/outputs/ver3_1_batch46_zq_normalization_sanity_20260716/report.json"
-TINY_GATE_REPORT="$ROOT/testset/outputs/ver3_1_batch46_tiny_identifiability_20260716/report.json"
+TINY_GATE_REPORT="$ROOT/testset/outputs/ver3_1_batch47_endpoint_gate_20260716/report.json"
 TRAIN_SCRIPT="$ROOT/scripts/ver3_1/train_ddlfm_cfm.py"
 INFER_SCRIPT="$ROOT/scripts/ver3_1/infer_ddlfm_cfm.py"
 EVAL_SCRIPT="$ROOT/scripts/ver3_1/evaluate_ddlfm_validation.py"
@@ -112,8 +122,8 @@ case "$ALLOW_PENDING_CHANNEL_STATS_DRY_RUN" in 0|1) ;; *) die "ALLOW_PENDING_CHA
 [ -x "$TORCHRUN" ] || die "missing torchrun: $TORCHRUN"
 [ "$COMPUTE_GROUP" = "$ALLOWED_COMPUTE_GROUP" ] || die "only MTTS-3-2-0715 is allowed"
 [ "$SPEC" = "$ALLOWED_SPEC" ] || die "only the registered 1x8 H200 spec is allowed"
-[ "$INSTANCES" = "1" ] || die "Batch-46 requires exactly one instance"
-[ "$GPU_TYPE" = "NVIDIA_H200_SXM_141G" ] || die "Batch-46 requires NVIDIA_H200_SXM_141G"
+[ "$INSTANCES" = "1" ] || die "Batch-47 requires exactly one instance"
+[ "$GPU_TYPE" = "NVIDIA_H200_SXM_141G" ] || die "Batch-47 requires NVIDIA_H200_SXM_141G"
 [ "$GLOBAL_BATCH" -eq $((PER_DEVICE_BATCH * GRAD_ACCUM_STEPS * WORLD_SIZE)) ] || die "global batch contract is inconsistent"
 [[ "$JOB_NAME" == codecVC-* ]] || die "job name must start with codecVC-"
 [[ "$BATCH_ID" == codecVC-* ]] || die "batch id must start with codecVC-"
@@ -133,9 +143,13 @@ done
 # this wrapper promises to pass.  This catches a stale snapshot before QZ.
 TRAIN_HELP="$(PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" "$TRAIN_SCRIPT" --help)"
 for option in \
-  --mode --t-sampling --t-logit-mu --t-logit-sigma --loss-weighting \
-  --loss-weight-eps --loss-weight-cap --speaker-dropout --cross-gate-init \
-  --gate-warmup-steps --gate-warmup-start --ema-decay --ema-warmup --zq-channel-stats; do
+  --mode --t-sampling --t-logit-mu --t-logit-sigma --t-shift-power \
+  --t-mode-shift-m --loss-weighting --loss-weight-eps --loss-weight-cap \
+  --speaker-dropout --semantic-dropout --aux-loss-weight --aux-warmup-steps \
+  --speaker-cfg-scale --semantic-cfg-scale --num-speaker-prompt-tokens \
+  --speaker-condition-scale --speaker-input-scale \
+  --cross-gate-init --gate-warmup-steps --gate-warmup-start --ema-decay \
+  --ema-warmup --zq-channel-stats; do
   grep -q -- "$option" <<<"$TRAIN_HELP" || die "training entry point is missing $option"
 done
 
@@ -223,7 +237,7 @@ if failed:
 PY
   CHANNEL_STATS_READY=1
 elif [ "$DRY_RUN" = "1" ] && [ "$ALLOW_PENDING_CHANNEL_STATS_DRY_RUN" = "1" ]; then
-  echo "[batch46-submit] WARNING: canonical channel_stats.pt is pending; static dry-run only" >&2
+  echo "[batch47-submit] WARNING: canonical channel_stats.pt is pending; static dry-run only" >&2
 else
   die "canonical channel stats are not ready: $CHANNEL_STATS"
 fi
@@ -253,14 +267,15 @@ tiny_gates = tiny.get("gates") or {}
 tiny_checks = {
     "status": tiny.get("status") == "passed",
     "steps": int(tiny.get("steps", -1)) == 800,
-    "cfg": float(tiny.get("cfg_scale", -1)) == 1.5,
+    "speaker_cfg": float(tiny.get("speaker_cfg_scale", -1)) == 2.5,
+    "semantic_cfg": float(tiny.get("semantic_cfg_scale", -1)) == 2.0,
     "stats sha": tiny.get("zq_channel_stats_sha256") == stats_sha,
     "all gates": bool(tiny_gates) and all(bool(value) for value in tiny_gates.values()),
 }
 failed = [f"normalization:{name}" for name, ok in normalization_checks.items() if not ok]
 failed += [f"tiny:{name}" for name, ok in tiny_checks.items() if not ok]
 if failed:
-    raise SystemExit("Batch-46 local sanity contract failed: " + ", ".join(failed))
+    raise SystemExit("Batch-47 local sanity contract failed: " + ", ".join(failed))
 PY
   NORMALIZATION_SANITY_READY=1
   TINY_GATE_READY=1
@@ -274,12 +289,12 @@ if [ "$DRY_RUN" = "0" ]; then
   [ "$SOURCE_BRANCH" = "$REQUIRED_BRANCH" ] || die "live submission must stay on $REQUIRED_BRANCH"
   [ "$WORKTREE_CLEAN" = "1" ] || die "live submission requires a clean worktree"
   [ "$READY_TAG_AT_HEAD" = "1" ] || die "live submission requires $REQUIRED_READY_TAG at HEAD"
-  [ "${ALLOW_CODECVC_BATCH46_SUBMIT:-0}" = "1" ] || die "live submission guarded; set ALLOW_CODECVC_BATCH46_SUBMIT=1"
+  [ "${ALLOW_CODECVC_BATCH47_SUBMIT:-0}" = "1" ] || die "live submission guarded; set ALLOW_CODECVC_BATCH47_SUBMIT=1"
 fi
 
-[ ! -e "$OUTPUT_ROOT/COMPLETED.json" ] || die "Batch-46 output is already complete: $OUTPUT_ROOT"
+[ ! -e "$OUTPUT_ROOT/COMPLETED.json" ] || die "Batch-47 output is already complete: $OUTPUT_ROOT"
 if [ -d "$OUTPUT_ROOT" ] && [ -n "$(find "$OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-  die "Batch-46 output root is non-empty; use a fresh BATCH_ID/OUTPUT_ROOT"
+  die "Batch-47 output root is non-empty; use a fresh BATCH_ID/OUTPUT_ROOT"
 fi
 
 mkdir -p "$SNAPSHOT_ROOT/scripts/ver3_1" "$SNAPSHOT_ROOT/moss_codecvc" \
@@ -298,7 +313,7 @@ printf '%s\n' "$SOURCE_BRANCH" >"$SNAPSHOT_ROOT/SOURCE_BRANCH"
 find "$SNAPSHOT_ROOT" -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >"$SNAPSHOT_ROOT/SHA256SUMS"
 
 SNAPSHOT_STATS="$SNAPSHOT_ROOT/prepared/zq_targets_v1/channel_stats.pt"
-RUNNER="$RECORD_ROOT/run_batch46_ddlfm_probe_qz.sh"
+RUNNER="$RECORD_ROOT/run_batch47_ddlfm_probe_qz.sh"
 cat >"$RUNNER" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -348,13 +363,23 @@ mkdir -p "\$OUTPUT_ROOT"
   --num-layers "$NUM_LAYERS" \\
   --num-heads "$NUM_HEADS" \\
   --ffn-size "$FFN_SIZE" \\
+  --num-speaker-prompt-tokens "$NUM_SPEAKER_PROMPT_TOKENS" \\
+  --speaker-condition-scale "$SPEAKER_CONDITION_SCALE" \\
+  --speaker-input-scale "$SPEAKER_INPUT_SCALE" \\
   --t-sampling "$T_SAMPLING" \\
   --t-logit-mu "$T_LOGIT_MU" \\
   --t-logit-sigma "$T_LOGIT_SIGMA" \\
+  --t-shift-power "$T_SHIFT_POWER" \\
+  --t-mode-shift-m "$T_MODE_SHIFT_M" \\
   --loss-weighting "$LOSS_WEIGHTING" \\
   --loss-weight-eps "$LOSS_WEIGHT_EPS" \\
   --loss-weight-cap "$LOSS_WEIGHT_CAP" \\
   --speaker-dropout "$SPEAKER_DROPOUT" \\
+  --semantic-dropout "$SEMANTIC_DROPOUT" \\
+  --aux-loss-weight "$AUX_LOSS_WEIGHT" \\
+  --aux-warmup-steps "$AUX_WARMUP_STEPS" \\
+  --speaker-cfg-scale "$EVAL_SPEAKER_CFG_SCALE" \\
+  --semantic-cfg-scale "$EVAL_SEMANTIC_CFG_SCALE" \\
   --ema-decay "$EMA_DECAY" \\
   --ema-warmup \\
   --cross-gate-init "$CROSS_GATE_INIT" \\
@@ -383,7 +408,7 @@ inference_checkpoint = Path(str(ready.get("inference_checkpoint") or ""))
 if not inference_checkpoint.is_file():
     raise SystemExit(f"final inference checkpoint is missing: {inference_checkpoint}")
 payload = {
-    "schema": "ver3_1_batch46_ddlfm_probe_completion_v1",
+    "schema": "ver3_1_batch47_ddlfm_probe_completion_v1",
     "status": "completed",
     "completed_at_unix": time.time(),
     "steps": 3000,
@@ -394,7 +419,8 @@ payload = {
     "checkpoint_ready_marker": str(ready_path),
     "local_evaluation": {
         "device": "local RTX4090",
-        "cfg_scale": 1.5,
+        "speaker_cfg_scale": 2.5,
+        "semantic_cfg_scale": 2.0,
         "checkpoints": [500, 1000, 1500, 2000, 2500, 3000],
         "quick20_every": 500,
         "primary": {"weights": "ema", "use_ema": True},
@@ -422,7 +448,7 @@ import json
 import pathlib
 
 payload = {
-    "schema": "ver3_1_batch46_ddlfm_qz_preflight_v1",
+    "schema": "ver3_1_batch47_ddlfm_qz_preflight_v1",
     "job_name": "$JOB_NAME",
     "batch_id": "$BATCH_ID",
     "dry_run": bool(int("$DRY_RUN")),
@@ -478,13 +504,23 @@ payload = {
         "num_layers": $NUM_LAYERS,
         "num_heads": $NUM_HEADS,
         "ffn_size": $FFN_SIZE,
+        "num_speaker_prompt_tokens": $NUM_SPEAKER_PROMPT_TOKENS,
+        "speaker_condition_scale": $SPEAKER_CONDITION_SCALE,
+        "speaker_input_scale": $SPEAKER_INPUT_SCALE,
         "t_sampling": "$T_SAMPLING",
         "t_logit_mu": $T_LOGIT_MU,
         "t_logit_sigma": $T_LOGIT_SIGMA,
+        "t_shift_power": $T_SHIFT_POWER,
+        "t_mode_shift_m": $T_MODE_SHIFT_M,
         "loss_weighting": "$LOSS_WEIGHTING",
         "loss_weight_eps": $LOSS_WEIGHT_EPS,
         "loss_weight_cap": $LOSS_WEIGHT_CAP,
         "speaker_dropout": $SPEAKER_DROPOUT,
+        "semantic_dropout": $SEMANTIC_DROPOUT,
+        "aux_loss_weight": $AUX_LOSS_WEIGHT,
+        "aux_warmup_steps": $AUX_WARMUP_STEPS,
+        "speaker_cfg_scale": $EVAL_SPEAKER_CFG_SCALE,
+        "semantic_cfg_scale": $EVAL_SEMANTIC_CFG_SCALE,
         "ema_decay": $EMA_DECAY,
         "ema_warmup": bool(int("$EMA_WARMUP")),
         "cross_gate_init": $CROSS_GATE_INIT,
@@ -492,7 +528,8 @@ payload = {
         "gate_warmup_start": $GATE_WARMUP_START,
     },
     "local_evaluation": {
-        "cfg_scale": $EVAL_CFG_SCALE,
+        "speaker_cfg_scale": $EVAL_SPEAKER_CFG_SCALE,
+        "semantic_cfg_scale": $EVAL_SEMANTIC_CFG_SCALE,
         "mode": "no_text",
         "quick20_checkpoints": [500, 1000, 1500, 2000, 2500, 3000],
         "primary": {
@@ -520,10 +557,11 @@ PY
 
 cat >"$RECORD_ROOT/local_eval_contract.json" <<EOF
 {
-  "schema": "ver3_1_batch46_local_eval_contract_v1",
+  "schema": "ver3_1_batch47_local_eval_contract_v1",
   "checkpoint_root": "$OUTPUT_ROOT",
   "mode": "no_text",
-  "cfg_scale": $EVAL_CFG_SCALE,
+  "speaker_cfg_scale": $EVAL_SPEAKER_CFG_SCALE,
+  "semantic_cfg_scale": $EVAL_SEMANTIC_CFG_SCALE,
   "sampling_steps": 20,
   "quick20_steps": [500, 1000, 1500, 2000, 2500, 3000],
   "trigger": "wait for step-XXXXXX.ready.json, then load its inference_checkpoint",
@@ -543,19 +581,20 @@ cat >"$RECORD_ROOT/local_eval_contract.json" <<EOF
 }
 EOF
 
-echo "[batch46-submit] job=$JOB_NAME"
-echo "[batch46-submit] resource=MTTS-3-2-0715 spec=$SPEC instances=1 gpus=8"
-echo "[batch46-submit] data=v1/no_text rows=$NO_TEXT_ROWS channel_stats=$CHANNEL_STATS_READY"
-echo "[batch46-submit] train=gbs$GLOBAL_BATCH steps=$STEPS warmup=$WARMUP_STEPS save=$SAVE_STEPS"
-echo "[batch46-submit] cfm=$T_SAMPLING/$LOSS_WEIGHTING speaker_dropout=$SPEAKER_DROPOUT ema=$EMA_DECAY/warmup"
-echo "[batch46-submit] gate=init$CROSS_GATE_INIT/ramp${GATE_WARMUP_STEPS} eval=EMA+CFG$EVAL_CFG_SCALE(local-4090)"
-echo "[batch46-submit] launch_ready=$LAUNCH_READY preflight=$RECORD_ROOT/preflight.json"
+echo "[batch47-submit] job=$JOB_NAME"
+echo "[batch47-submit] resource=MTTS-3-2-0715 spec=$SPEC instances=1 gpus=8"
+echo "[batch47-submit] data=v1/no_text rows=$NO_TEXT_ROWS channel_stats=$CHANNEL_STATS_READY"
+echo "[batch47-submit] train=gbs$GLOBAL_BATCH steps=$STEPS warmup=$WARMUP_STEPS save=$SAVE_STEPS"
+echo "[batch47-submit] cfm=$T_SAMPLING(power=$T_SHIFT_POWER)/$LOSS_WEIGHTING eps=$LOSS_WEIGHT_EPS cap=$LOSS_WEIGHT_CAP"
+echo "[batch47-submit] dropout=speaker$SPEAKER_DROPOUT semantic$SEMANTIC_DROPOUT aux=$AUX_LOSS_WEIGHT/$AUX_WARMUP_STEPS"
+echo "[batch47-submit] speaker_prompts=$NUM_SPEAKER_PROMPT_TOKENS speaker_condition_scale=$SPEAKER_CONDITION_SCALE speaker_input_scale=$SPEAKER_INPUT_SCALE cfg=speaker$EVAL_SPEAKER_CFG_SCALE semantic$EVAL_SEMANTIC_CFG_SCALE"
+echo "[batch47-submit] launch_ready=$LAUNCH_READY preflight=$RECORD_ROOT/preflight.json"
 
 if [ "$DRY_RUN" = "1" ]; then
   printf 'job_name\tcompute_group\tspec\tinstances\tgpus\toutput_root\trunner\tlaunch_ready\n%s\t%s\t%s\t1\t8\t%s\t%s\t%s\n' \
     "$JOB_NAME" "$COMPUTE_GROUP" "$SPEC" "$OUTPUT_ROOT" "$RUNNER" "$LAUNCH_READY" \
     >"$RECORD_ROOT/submission_plan.tsv"
-  echo "[batch46-submit] DRY_RUN=1; qzcli was not called and no job was created"
+  echo "[batch47-submit] DRY_RUN=1; qzcli was not called and no job was created"
   exit 0
 fi
 
@@ -590,4 +629,4 @@ printf 'job_name\tjob_id\tcompute_group\tspec\tinstances\tgpus\toutput_root\trun
   "$JOB_NAME" "$JOB_ID" "$COMPUTE_GROUP" "$SPEC" "$OUTPUT_ROOT" "$RUNNER" \
   >"$LEDGER"
 cp -p "$LEDGER" "$RECORD_ROOT/submitted_jobs.tsv"
-echo "[batch46-submit] submitted job_id=$JOB_ID"
+echo "[batch47-submit] submitted job_id=$JOB_ID"

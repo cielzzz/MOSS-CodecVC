@@ -61,7 +61,12 @@ from scripts.ver3_1.extract_semantic_v3_1 import (
     load_adapter,
     load_wavlm,
 )
-from scripts.ver3_1.infer_ddlfm_cfm import combine_cfg_velocity, encode_text, load_checkpoint
+from scripts.ver3_1.infer_ddlfm_cfm import (
+    combine_cfg_velocity,
+    combine_dual_cfg_velocity,
+    encode_text,
+    load_checkpoint,
+)
 
 
 DEFAULT_VALIDATION = ROOT / "testset/validation/seedtts_vc_ver2_3_validation.jsonl"
@@ -100,6 +105,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Default: 1.5 for CFG-trained checkpoints, otherwise 1.0.",
     )
+    ap.add_argument("--speaker-cfg-scale", type=float, default=None)
+    ap.add_argument("--semantic-cfg-scale", type=float, default=None)
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument(
         "--zq-channel-stats",
@@ -333,6 +340,16 @@ class ResourceBundle:
             if args.cfg_scale is not None
             else (1.5 if float(self.cfg.get("speaker_dropout", 0.0)) > 0.0 else 1.0)
         )
+        self.speaker_cfg_scale = (
+            float(args.speaker_cfg_scale)
+            if args.speaker_cfg_scale is not None
+            else float(self.cfg.get("speaker_cfg_scale", self.cfg_scale))
+        )
+        self.semantic_cfg_scale = (
+            float(args.semantic_cfg_scale)
+            if args.semantic_cfg_scale is not None
+            else float(self.cfg.get("semantic_cfg_scale", 0.0))
+        )
         self.zq_stats_path: Path | None = None
         self.zq_stats_sha256 = ""
         self.zq_stats: dict[str, Any] | None = None
@@ -440,6 +457,7 @@ def sample_velocity_batch(
     modalities: list[int],
     steps: int,
     cfg_scale: float,
+    semantic_cfg_scale: float,
     device: torch.device,
     seeds: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -465,31 +483,62 @@ def sample_velocity_batch(
     if not math.isfinite(float(cfg_scale)) or float(cfg_scale) < 0.0:
         raise ValueError("cfg_scale must be finite and non-negative")
     zero_speaker = torch.zeros_like(speaker)
+    zero_semantic = torch.zeros_like(semantic)
+    zero_semantic_mask = torch.zeros_like(semantic_mask, dtype=torch.bool)
     modality = torch.as_tensor(modalities, dtype=torch.long, device=device)
+    if not math.isfinite(float(semantic_cfg_scale)) or float(semantic_cfg_scale) < 0.0:
+        raise ValueError("semantic_cfg_scale must be finite and non-negative")
     for index in range(int(steps)):
         t = torch.full((batch,), float(index) / float(steps), device=device)
-        velocity_cond = module.decoder(
-            x,
-            t,
-            semantic,
-            speaker,
-            target_mask=target_mask,
-            semantic_mask=semantic_mask,
-            semantic_modality=modality,
-        ).velocity
-        if float(cfg_scale) == 1.0:
-            velocity = velocity_cond
-        else:
-            velocity_uncond = module.decoder(
-                x,
-                t,
-                semantic,
-                zero_speaker,
+        if float(semantic_cfg_scale) > 0.0:
+            velocity_cond = module.decoder(
+                x, t, semantic, speaker,
                 target_mask=target_mask,
                 semantic_mask=semantic_mask,
                 semantic_modality=modality,
             ).velocity
-            velocity = combine_cfg_velocity(velocity_cond, velocity_uncond, float(cfg_scale))
+            velocity_speaker = module.decoder(
+                x, t, zero_semantic, speaker,
+                target_mask=target_mask,
+                semantic_mask=zero_semantic_mask,
+                semantic_modality=modality,
+            ).velocity
+            velocity_semantic = module.decoder(
+                x, t, semantic, zero_speaker,
+                target_mask=target_mask,
+                semantic_mask=semantic_mask,
+                semantic_modality=modality,
+            ).velocity
+            velocity = combine_dual_cfg_velocity(
+                velocity_cond,
+                velocity_speaker,
+                velocity_semantic,
+                float(cfg_scale),
+                float(semantic_cfg_scale),
+            )
+        else:
+            velocity_cond = module.decoder(
+                x,
+                t,
+                semantic,
+                speaker,
+                target_mask=target_mask,
+                semantic_mask=semantic_mask,
+                semantic_modality=modality,
+            ).velocity
+            if float(cfg_scale) == 1.0:
+                velocity = velocity_cond
+            else:
+                velocity_uncond = module.decoder(
+                    x,
+                    t,
+                    semantic,
+                    zero_speaker,
+                    target_mask=target_mask,
+                    semantic_mask=semantic_mask,
+                    semantic_modality=modality,
+                ).velocity
+                velocity = combine_cfg_velocity(velocity_cond, velocity_uncond, float(cfg_scale))
         x = x + velocity / float(steps)
     return x, torch.as_tensor(target_lengths, dtype=torch.long, device=device)
 
@@ -520,7 +569,8 @@ def write_wavs(bundle: ResourceBundle, prepared: list[Prepared], output_dir: Pat
                 torch.stack([item.speaker for item in todo_group]),
                 [0 if item.mode == "no_text" else 1 for item in todo_group],
                 int(args.sampling_steps),
-                float(bundle.cfg_scale),
+                float(bundle.speaker_cfg_scale),
+                float(bundle.semantic_cfg_scale),
                 bundle.device,
                 [case_seed(int(args.seed), str(item.row.get("case_id") or "")) for item in todo_group],
             )
@@ -554,7 +604,9 @@ def write_wavs(bundle: ResourceBundle, prepared: list[Prepared], output_dir: Pat
                 "output_wav": str(path),
                 "target_frames": int(item.target_frames),
                 "sampling_steps": int(args.sampling_steps),
-                "cfg_scale": float(bundle.cfg_scale),
+                "cfg_scale": float(bundle.speaker_cfg_scale),
+                "speaker_cfg_scale": float(bundle.speaker_cfg_scale),
+                "semantic_cfg_scale": float(bundle.semantic_cfg_scale),
                 "using_ema": bundle.using_ema,
                 "zq_normalization_enabled": bundle.zq_normalization_enabled,
                 "zq_channel_stats": str(bundle.zq_stats_path) if bundle.zq_stats_path is not None else None,
@@ -660,6 +712,8 @@ def main() -> int:
         "by_mode": {mode: sum(str(r.get("mode")) == mode for r in output_rows) for mode in ("no_text", "text")},
         "sampling_steps": int(args.sampling_steps),
         "cfg_scale": float(bundle.cfg_scale),
+        "speaker_cfg_scale": float(bundle.speaker_cfg_scale),
+        "semantic_cfg_scale": float(bundle.semantic_cfg_scale),
         "using_ema": bundle.using_ema,
         "zq_normalization_enabled": bundle.zq_normalization_enabled,
         "zq_channel_stats": str(bundle.zq_stats_path) if bundle.zq_stats_path is not None else None,
