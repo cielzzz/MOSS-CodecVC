@@ -650,32 +650,10 @@ def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
         for submodule in module.decoder.speaker_proj
         for parameter in submodule.parameters(recurse=False)
     ]
-    tte = module.decoder.timbre_memory
+    speaker_expand = module.decoder.speaker_expand
     return {
-        "timbre_memory_grad_l2_rank_local_preclip": _gradient_l2(
-            list(tte.parameters())
-        ),
-        "timbre_query_generator_grad_l2_rank_local_preclip": _gradient_l2(
-            list(tte.query_generator.parameters())
-        ),
-        "timbre_memory_up_grad_l2_rank_local_preclip": _gradient_l2(
-            list(tte.memory_up.parameters())
-        ),
-        "timbre_speaker_token_grad_l2_rank_local_preclip": _gradient_l2(
-            list(tte.speaker_token.parameters()) if tte.speaker_token is not None else []
-        ),
-        "timbre_encoder_grad_l2_rank_local_preclip": _gradient_l2(
-            list(tte.ref_encoder.parameters()) if tte.ref_encoder is not None else []
-        ),
-        "timbre_attention_entropy_normalized": float(
-            getattr(tte, "_last_attention_entropy_normalized", 1.0)
-        ),
-        "timbre_attention_max_minus_mean": float(
-            getattr(tte, "_last_attn_max_minus_mean", 0.0)
-        ),
-        "timbre_query_scale_value": float(tte.query_scale.detach().float().item()),
-        "timbre_query_pairwise_cosine": float(
-            getattr(tte, "_last_query_pairwise_cosine", 1.0)
+        "speaker_expand_grad_l2_rank_local_preclip": _gradient_l2(
+            list(speaker_expand.parameters())
         ),
         "speaker_adaln_grad_l2_rank_local_preclip": _gradient_l2(
             [
@@ -892,23 +870,9 @@ def main() -> int:
     args.zq_normalization_enabled = True
     zq_mean = zq_stats["mean"].to(device=device, dtype=torch.float32).view(1, 1, -1)
     zq_std = zq_stats["std"].to(device=device, dtype=torch.float32).view(1, 1, -1)
-    query_scale_parameter = raw_module.decoder.timbre_memory.query_scale
-    query_generator_parameters = list(
-        raw_module.decoder.timbre_memory.query_generator.parameters()
-    )
-    query_generator_ids = {id(parameter) for parameter in query_generator_parameters}
-    query_scale_ids = {id(query_scale_parameter)}
-    other_parameters = [
-        parameter for parameter in module.parameters()
-        if id(parameter) not in query_generator_ids
-        and id(parameter) not in query_scale_ids
-    ]
     optimizer = torch.optim.AdamW(
-        [
-            {"params": other_parameters, "lr": float(args.lr), "lr_multiplier": 1.0},
-            {"params": query_generator_parameters, "lr": float(args.lr) * 5.0, "lr_multiplier": 5.0},
-            {"params": [query_scale_parameter], "lr": float(args.lr), "lr_multiplier": 1.0},
-        ],
+        module.parameters(),
+        lr=float(args.lr),
         betas=(0.9, 0.95),
         weight_decay=0.01,
     )
@@ -935,7 +899,7 @@ def main() -> int:
         gate_scale = float(args.gate_warmup_start) + (1.0 - float(args.gate_warmup_start)) * gate_progress
         current_lr = float(args.lr) * warmup_scale
         for group in optimizer.param_groups:
-            group["lr"] = current_lr * float(group.get("lr_multiplier", 1.0))
+            group["lr"] = current_lr
         optimizer.zero_grad(set_to_none=True)
         loss_total = 0.0
         cfm_loss_total = 0.0

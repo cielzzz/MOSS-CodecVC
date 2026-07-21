@@ -24,7 +24,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-from moss_codecvc.models.timbre_memory import ReferenceCodecTimbreMemory
 
 
 def _sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -388,18 +387,11 @@ class DDLFMDecoder(nn.Module):
         nn.init.normal_(self.speaker_input_proj.weight, mean=0.0, std=0.05)
         nn.init.zeros_(self.speaker_input_proj.bias)
         self.modality_embedding = nn.Embedding(self.num_modalities, self.semantic_dim)
-        self.timbre_memory = ReferenceCodecTimbreMemory(
-            hidden_size=self.hidden_size,
-            num_memory_tokens=self.num_timbre_tokens,
-            num_heads=8,
-            adapter_dim=256,
-            dropout=0.0,
-            encoder_type="conformer",
-            encoder_layers=2,
-            conv_kernel_size=7,
-            speaker_embedding_dim=self.speaker_dim,
-            speaker_conditioning=True,
+        self.speaker_expand = nn.Sequential(
+            nn.LayerNorm(self.speaker_dim),
+            nn.Linear(self.speaker_dim, self.hidden_size),
         )
+        nn.init.zeros_(self.speaker_expand[-1].bias)
         self.layers = nn.ModuleList(
             [
                 DDLFMAdaLNBlock(
@@ -542,20 +534,6 @@ class DDLFMDecoder(nn.Module):
             target_mask = target_mask.to(device=x_t.device).bool()
             if tuple(target_mask.shape) != (batch, target_len):
                 raise ValueError(f"target_mask shape {tuple(target_mask.shape)} does not match x_t")
-        if prompt_zq is None:
-            prompt_zq = x_t.new_zeros((batch, 1, self.latent_dim))
-            prompt_mask = torch.zeros((batch, 1), dtype=torch.bool, device=x_t.device)
-        if prompt_mask is None:
-            prompt_mask = torch.ones(prompt_zq.shape[:2], dtype=torch.bool, device=x_t.device)
-        timbre_state = self.timbre_memory(
-            prompt_zq.to(dtype=x_t.dtype),
-            prompt_mask,
-            speaker_embedding=speaker,
-        )
-        timbre_tokens = timbre_state.timbre_tokens.to(dtype=x_t.dtype)
-        timbre_mask = torch.ones(
-            batch, timbre_tokens.shape[1], dtype=torch.bool, device=x_t.device
-        )
         semantic_len = int(semantic.shape[1])
         if semantic_mask is None:
             semantic_mask = torch.ones(batch, semantic_len, dtype=torch.bool, device=x_t.device)
@@ -590,8 +568,10 @@ class DDLFMDecoder(nn.Module):
         semantic = semantic.to(dtype=x.dtype)
         semantic = semantic + self.modality_embedding(semantic_modality).unsqueeze(1).to(dtype=x.dtype)
         semantic = self.semantic_proj(semantic).masked_fill(~semantic_mask.unsqueeze(-1), 0.0)
-        semantic = torch.cat([timbre_tokens, semantic], dim=1)
-        semantic_mask = torch.cat([timbre_mask, semantic_mask], dim=1)
+        speaker_prefix = self.speaker_expand(speaker.to(dtype=x.dtype)).unsqueeze(1)
+        semantic = torch.cat([speaker_prefix, semantic], dim=1)
+        speaker_prefix_mask = torch.ones(batch, 1, dtype=torch.bool, device=x.device)
+        semantic_mask = torch.cat([speaker_prefix_mask, semantic_mask], dim=1)
         target_positions = torch.arange(target_len, device=x.device)
         semantic_positions = torch.arange(semantic.shape[1], device=x.device)
         for layer in self.layers:
