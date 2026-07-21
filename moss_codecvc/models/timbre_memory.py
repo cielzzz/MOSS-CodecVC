@@ -267,6 +267,7 @@ class ReferenceCodecTimbreMemory(nn.Module):
         )
         self.memory_up = nn.Linear(adapter_dim, hidden_size)
         self.final_norm = nn.LayerNorm(hidden_size)
+        self._last_attention_entropy_normalized = 0.0
         nn.init.normal_(self.query, mean=0.0, std=0.02)
 
     def forward(
@@ -316,13 +317,20 @@ class ReferenceCodecTimbreMemory(nn.Module):
         key_padding_mask = None
         if ref_mask is not None:
             key_padding_mask = ~ref_mask.bool()
-        pooled, _ = self.pool(
+        pooled, attention_weights = self.pool(
             query=query,
             key=ref_embeddings,
             value=ref_embeddings,
             key_padding_mask=key_padding_mask,
-            need_weights=False,
+            need_weights=True,
+            average_attn_weights=False,
         )
+        with torch.no_grad():
+            probs = attention_weights.float().clamp_min(1.0e-8)
+            entropy = -(probs * probs.log()).sum(dim=-1)
+            self._last_attention_entropy_normalized = float(
+                (entropy / torch.log(torch.tensor(float(ref_embeddings.shape[1]), device=entropy.device))).mean().item()
+            )
         memory = self.final_norm(self.memory_up(pooled + self.out(pooled)))
         return TimbreMemoryState(timbre_tokens=memory, timbre_mask=None)
 

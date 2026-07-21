@@ -665,6 +665,16 @@ def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
         "timbre_encoder_grad_l2_rank_local_preclip": _gradient_l2(
             list(tte.ref_encoder.parameters()) if tte.ref_encoder is not None else []
         ),
+        "timbre_attention_entropy_normalized": float(
+            getattr(tte, "_last_attention_entropy_normalized", 1.0)
+        ),
+        "speaker_adaln_grad_l2_rank_local_preclip": _gradient_l2(
+            [
+                parameter
+                for layer in module.decoder.layers
+                for parameter in layer.speaker_adaln.parameters()
+            ]
+        ),
         "speaker_proj_grad_l2_rank_local_preclip": _gradient_l2(
             speaker_proj_parameters
         ),
