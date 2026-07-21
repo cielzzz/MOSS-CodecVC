@@ -64,7 +64,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--num-layers", type=int, default=12)
     ap.add_argument("--num-heads", type=int, default=12)
     ap.add_argument("--ffn-size", type=int, default=3072)
-    ap.add_argument("--num-speaker-prompt-tokens", type=int, default=4)
+    ap.add_argument("--num-timbre-tokens", type=int, default=32)
+    ap.add_argument("--prompt-zq-frames", type=int, default=64)
+    ap.add_argument("--speaker-cluster-index", default="")
+    ap.add_argument("--speaker-embedding-manifest", default="")
+    ap.add_argument("--identity-swap-probability", type=float, default=0.0)
     ap.add_argument("--speaker-condition-scale", type=float, default=4.0)
     ap.add_argument("--speaker-input-scale", type=float, default=1.0)
     ap.add_argument("--text-vocab-size", type=int, default=8001)
@@ -180,6 +184,7 @@ def load_embedding(path: str, expected_dim: int) -> torch.Tensor:
 
 @dataclass
 class CFMItem:
+    utterance_id: str
     mode: int
     zq_path: str
     semantic_path: str | None
@@ -195,9 +200,14 @@ class DDLFMDataset(Dataset[CFMItem]):
         max_rows: int = 0,
         max_frames: int = 0,
         mode: str = "no_text",
+        speaker_cluster_index: str = "",
+        prompt_zq_frames: int = 64,
+        speaker_embedding_manifest: str = "",
     ) -> None:
         self.max_frames = max(0, int(max_frames))
         self.mode = str(mode)
+        self.prompt_zq_frames = int(prompt_zq_frames)
+        self.cluster_members: dict[str, tuple[str, ...]] = {}
         if self.mode not in {"no_text", "all"}:
             raise ValueError(f"unsupported DDLFM dataset mode: {self.mode}")
         self.items: list[CFMItem] = []
@@ -213,17 +223,43 @@ class DDLFMDataset(Dataset[CFMItem]):
                     continue
                 self.items.append(
                     CFMItem(
+                        utterance_id=str(row.get("utterance_id") or ""),
                         mode=0 if mode_name == "no_text" else 1,
                         zq_path=str(row["zq_path"]),
                         semantic_path=str(row["semantic_path"]) if mode_name == "no_text" else None,
                         token_ids=list(row["content_token_ids"]) if mode_name == "text" else None,
-                        speaker_path=str(row["speaker_embedding_path"]),
+                    speaker_path=str(row.get("speaker_embedding_path") or ""),
                     )
                 )
                 if max_rows and len(self.items) >= int(max_rows):
                     break
         if not self.items:
             raise ValueError(f"empty DDLFM index: {index_path}")
+        if speaker_embedding_manifest:
+            manifest = {}
+            with Path(speaker_embedding_manifest).open() as handle:
+                for line in handle:
+                    row = json.loads(line)
+                    manifest[str(row["utterance_id"])] = str(row["embedding_path"])
+            for item in self.items:
+                if item.utterance_id in manifest:
+                    item.speaker_path = manifest[item.utterance_id]
+        self.item_by_utt = {item.utterance_id: item for item in self.items}
+        if speaker_cluster_index:
+            cluster_path = Path(speaker_cluster_index) / "clusters.jsonl"
+            if cluster_path.is_file():
+                with cluster_path.open() as handle:
+                    for line in handle:
+                        row = json.loads(line)
+                        self.cluster_members[str(row["trusted_group_id"])] = tuple(row["utterance_ids"])
+            map_path = Path(speaker_cluster_index) / "utt_to_cluster.jsonl"
+            self.utt_to_cluster = {}
+            if map_path.is_file():
+                with map_path.open() as handle:
+                    for line in handle:
+                        row = json.loads(line)
+                        if row.get("trusted_group_id") not in (None, "singleton"):
+                            self.utt_to_cluster[str(row["utterance_id"])] = str(row["trusted_group_id"])
 
     def __len__(self) -> int:
         return len(self.items)
@@ -233,7 +269,22 @@ class DDLFMDataset(Dataset[CFMItem]):
         zq = torch.from_numpy(np.load(item.zq_path).astype("float32", copy=False)).transpose(0, 1).contiguous()
         if zq.ndim != 2 or zq.shape[1] != 768:
             raise ValueError(f"zq must be [T,768], got {tuple(zq.shape)}: {item.zq_path}")
+        if not item.speaker_path:
+            raise ValueError(f"missing speaker embedding path for {item.utterance_id}")
         speaker = load_embedding(item.speaker_path, 192)
+        prompt_utt = item.utterance_id
+        group = self.utt_to_cluster.get(item.utterance_id)
+        candidates = [u for u in self.cluster_members.get(group, ()) if u != item.utterance_id and u in self.item_by_utt]
+        if candidates:
+            prompt_utt = random.choice(candidates)
+        prompt_item = self.item_by_utt[prompt_utt]
+        prompt_zq = torch.from_numpy(np.load(prompt_item.zq_path).astype("float32", copy=False)).transpose(0, 1).contiguous()
+        k = self.prompt_zq_frames
+        if prompt_zq.shape[0] > k:
+            start = random.randint(0, int(prompt_zq.shape[0]) - k)
+            prompt_zq = prompt_zq[start:start+k]
+        elif prompt_zq.shape[0] < k:
+            prompt_zq = torch.nn.functional.pad(prompt_zq, (0, 0, 0, k-int(prompt_zq.shape[0])))
         if item.mode == 0:
             semantic = torch.from_numpy(np.load(item.semantic_path).astype("float32", copy=False))
             if semantic.ndim != 2 or semantic.shape[1] != 512:
@@ -245,14 +296,14 @@ class DDLFMDataset(Dataset[CFMItem]):
                 start = random.randint(0, int(zq.shape[0]) - self.max_frames)
                 zq = zq[start : start + self.max_frames]
                 semantic = semantic[start : start + self.max_frames]
-            return {"mode": item.mode, "zq": zq, "semantic": semantic, "token_ids": None, "speaker": speaker}
+            return {"mode": item.mode, "zq": zq, "semantic": semantic, "token_ids": None, "speaker": speaker, "prompt_zq": prompt_zq, "prompt_utt": prompt_utt}
         if self.max_frames and zq.shape[0] > self.max_frames:
             start = random.randint(0, int(zq.shape[0]) - self.max_frames)
             zq = zq[start : start + self.max_frames]
         tokens = torch.as_tensor(item.token_ids, dtype=torch.long)
         if tokens.ndim != 1 or tokens.numel() <= 0:
             raise ValueError(f"text row has invalid token ids: {item.zq_path}")
-        return {"mode": item.mode, "zq": zq, "semantic": None, "token_ids": tokens, "speaker": speaker}
+        return {"mode": item.mode, "zq": zq, "semantic": None, "token_ids": tokens, "speaker": speaker, "prompt_zq": prompt_zq, "prompt_utt": prompt_utt}
 
 
 def collate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -261,6 +312,8 @@ def collate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     max_t = max(int(row["zq"].shape[0]) for row in rows)
     latent_dim = int(rows[0]["zq"].shape[1])
     zq = torch.zeros(len(rows), max_t, latent_dim, dtype=torch.float32)
+    prompt_zq = torch.stack([row["prompt_zq"] for row in rows])
+    prompt_mask = torch.ones(prompt_zq.shape[:2], dtype=torch.bool)
     target_mask = torch.zeros(len(rows), max_t, dtype=torch.bool)
     speakers = torch.stack([row["speaker"] for row in rows])
     modes = torch.tensor([int(row["mode"]) for row in rows], dtype=torch.long)
@@ -291,6 +344,8 @@ def collate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             token_mask[idx, : tok.shape[0]] = True
     return {
         "zq": zq,
+        "prompt_zq": prompt_zq,
+        "prompt_mask": prompt_mask,
         "target_mask": target_mask,
         "speaker": speakers,
         "mode": modes,
@@ -319,7 +374,7 @@ class DDLFMTrainModule(nn.Module):
             num_heads=heads,
             ffn_size=ffn,
             cross_gate_init=float(getattr(args, "cross_gate_init", 0.0)),
-            num_speaker_prompt_tokens=int(getattr(args, "num_speaker_prompt_tokens", 4)),
+            num_timbre_tokens=int(getattr(args, "num_timbre_tokens", 32)),
             speaker_condition_scale=float(getattr(args, "speaker_condition_scale", 4.0)),
             speaker_input_scale=float(getattr(args, "speaker_input_scale", 1.0)),
         )
@@ -596,8 +651,8 @@ def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
         for parameter in submodule.parameters(recurse=False)
     ]
     return {
-        "speaker_prompt_grad_l2_rank_local_preclip": _gradient_l2(
-            [module.decoder.speaker_prompt]
+        "timbre_memory_grad_l2_rank_local_preclip": _gradient_l2(
+            list(module.decoder.timbre_memory.parameters())
         ),
         "speaker_proj_grad_l2_rank_local_preclip": _gradient_l2(
             speaker_proj_parameters
@@ -737,8 +792,8 @@ def main() -> int:
         raise ValueError("aux-loss-weight must be non-negative")
     if int(args.aux_warmup_steps) <= 0:
         raise ValueError("aux-warmup-steps must be positive")
-    if int(args.num_speaker_prompt_tokens) <= 0:
-        raise ValueError("num-speaker-prompt-tokens must be positive")
+    if int(args.num_timbre_tokens) <= 0:
+        raise ValueError("num-timbre-tokens must be positive")
     if not math.isfinite(float(args.speaker_condition_scale)) or float(args.speaker_condition_scale) < 0.0:
         raise ValueError("speaker-condition-scale must be finite and non-negative")
     if not math.isfinite(float(args.speaker_input_scale)) or float(args.speaker_input_scale) < 0.0:
@@ -765,6 +820,9 @@ def main() -> int:
         max_rows=int(args.max_rows),
         max_frames=int(args.max_frames),
         mode=str(args.mode),
+        speaker_cluster_index=str(args.speaker_cluster_index),
+        prompt_zq_frames=int(args.prompt_zq_frames),
+        speaker_embedding_manifest=str(args.speaker_embedding_manifest),
     )
     sampler = DistributedSampler(dataset, shuffle=True, seed=int(args.seed)) if use_dist else None
     loader = DataLoader(
@@ -873,6 +931,14 @@ def main() -> int:
                 batch["speaker"],
                 float(args.speaker_dropout),
             )
+            prompt_input = batch["prompt_zq"].to(device=device)
+            if bool(speaker_drop_mask.any().item()):
+                prompt_input = prompt_input.clone()
+                prompt_input[speaker_drop_mask] = 0.0
+            prompt_mask_input = batch["prompt_mask"].to(device=device)
+            if bool(speaker_drop_mask.any().item()):
+                prompt_mask_input = prompt_mask_input.clone()
+                prompt_mask_input[speaker_drop_mask] = False
             sample_weight = cfm_loss_weights(
                 t,
                 mode=str(args.loss_weighting),
@@ -890,6 +956,8 @@ def main() -> int:
                     target_mask=batch["target_mask"],
                     semantic_mask=semantic_mask_input,
                     semantic_modality=batch["mode"],
+                    prompt_zq=prompt_input,
+                    prompt_mask=prompt_mask_input,
                     condition_gate_scale=gate_scale,
                 ).velocity
                 cfm_loss = masked_mse(
@@ -915,6 +983,8 @@ def main() -> int:
                         target_mask=batch["target_mask"],
                         semantic_mask=full_semantic_mask,
                         semantic_modality=batch["mode"],
+                        prompt_zq=batch["prompt_zq"].to(device=device),
+                        prompt_mask=batch["prompt_mask"].to(device=device),
                         condition_gate_scale=gate_scale,
                     ).velocity
                     aux_loss = masked_mse(

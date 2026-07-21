@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from moss_codecvc.models.timbre_memory import ReferenceCodecTimbreMemory
 
 
 def _sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -341,7 +342,7 @@ class DDLFMDecoder(nn.Module):
         num_modalities: int = 2,
         rope_base: float = 10000.0,
         cross_gate_init: float = 0.0,
-        num_speaker_prompt_tokens: int = 4,
+        num_timbre_tokens: int = 32,
         speaker_condition_scale: float = 4.0,
         speaker_input_scale: float = 1.0,
     ) -> None:
@@ -351,13 +352,11 @@ class DDLFMDecoder(nn.Module):
         self.speaker_dim = int(speaker_dim)
         self.hidden_size = int(hidden_size)
         self.num_modalities = int(num_modalities)
-        self.num_speaker_prompt_tokens = int(num_speaker_prompt_tokens)
+        self.num_timbre_tokens = int(num_timbre_tokens)
         self.speaker_condition_scale = float(speaker_condition_scale)
         self.speaker_input_scale = float(speaker_input_scale)
         if self.num_modalities < 1:
             raise ValueError("num_modalities must be positive")
-        if self.num_speaker_prompt_tokens < 1:
-            raise ValueError("num_speaker_prompt_tokens must be positive")
         if not math.isfinite(self.speaker_condition_scale) or self.speaker_condition_scale < 0.0:
             raise ValueError("speaker_condition_scale must be finite and non-negative")
         if not math.isfinite(self.speaker_input_scale) or self.speaker_input_scale < 0.0:
@@ -389,23 +388,18 @@ class DDLFMDecoder(nn.Module):
         nn.init.normal_(self.speaker_input_proj.weight, mean=0.0, std=0.05)
         nn.init.zeros_(self.speaker_input_proj.bias)
         self.modality_embedding = nn.Embedding(self.num_modalities, self.semantic_dim)
-        self.speaker_prompt = nn.Parameter(
-            torch.zeros(1, self.num_speaker_prompt_tokens, self.hidden_size)
+        self.timbre_memory = ReferenceCodecTimbreMemory(
+            hidden_size=self.hidden_size,
+            num_memory_tokens=self.num_timbre_tokens,
+            num_heads=8,
+            adapter_dim=256,
+            dropout=0.0,
+            encoder_type="conformer",
+            encoder_layers=2,
+            conv_kernel_size=7,
+            speaker_embedding_dim=self.speaker_dim,
+            speaker_conditioning=True,
         )
-        # Four independent speaker-to-prompt MLPs.  Their final biases are
-        # zero so the zero-speaker branch has no hidden speaker offset.
-        self.speaker_prompt_mlps = nn.ModuleList()
-        for _ in range(self.num_speaker_prompt_tokens):
-            mlp = nn.Sequential(
-                nn.LayerNorm(self.speaker_dim),
-                nn.Linear(self.speaker_dim, self.hidden_size),
-                nn.SiLU(),
-                nn.Linear(self.hidden_size, self.hidden_size),
-            )
-            for module in mlp:
-                if isinstance(module, nn.Linear):
-                    nn.init.zeros_(module.bias)
-            self.speaker_prompt_mlps.append(mlp)
         self.layers = nn.ModuleList(
             [
                 DDLFMAdaLNBlock(
@@ -524,6 +518,8 @@ class DDLFMDecoder(nn.Module):
         semantic: torch.Tensor,
         speaker: torch.Tensor,
         *,
+        prompt_zq: torch.Tensor | None = None,
+        prompt_mask: torch.Tensor | None = None,
         target_mask: torch.Tensor | None = None,
         semantic_mask: torch.Tensor | None = None,
         semantic_modality: torch.Tensor | None = None,
@@ -546,6 +542,20 @@ class DDLFMDecoder(nn.Module):
             target_mask = target_mask.to(device=x_t.device).bool()
             if tuple(target_mask.shape) != (batch, target_len):
                 raise ValueError(f"target_mask shape {tuple(target_mask.shape)} does not match x_t")
+        if prompt_zq is None:
+            prompt_zq = x_t.new_zeros((batch, 1, self.latent_dim))
+            prompt_mask = torch.zeros((batch, 1), dtype=torch.bool, device=x_t.device)
+        if prompt_mask is None:
+            prompt_mask = torch.ones(prompt_zq.shape[:2], dtype=torch.bool, device=x_t.device)
+        timbre_state = self.timbre_memory(
+            prompt_zq.to(dtype=x_t.dtype),
+            prompt_mask,
+            speaker_embedding=speaker,
+        )
+        timbre_tokens = timbre_state.timbre_tokens.to(dtype=x_t.dtype)
+        timbre_mask = torch.ones(
+            batch, timbre_tokens.shape[1], dtype=torch.bool, device=x_t.device
+        )
         semantic_len = int(semantic.shape[1])
         if semantic_mask is None:
             semantic_mask = torch.ones(batch, semantic_len, dtype=torch.bool, device=x_t.device)
@@ -580,53 +590,10 @@ class DDLFMDecoder(nn.Module):
         semantic = semantic.to(dtype=x.dtype)
         semantic = semantic + self.modality_embedding(semantic_modality).unsqueeze(1).to(dtype=x.dtype)
         semantic = self.semantic_proj(semantic).masked_fill(~semantic_mask.unsqueeze(-1), 0.0)
-        # A zero speaker embedding is the classifier-free unconditional
-        # branch.  The learnable ``speaker_prompt`` anchors are useful for a
-        # conditional row, but must not survive into that branch or they leak
-        # a fixed speaker signal into ``v(∅, ·)``.  Keep the mask row-wise so
-        # ordinary non-zero speaker embeddings retain the learned anchors.
-        speaker_active = (
-            speaker.detach().abs().sum(dim=-1, keepdim=True) > 1.0e-8
-        ).to(dtype=x.dtype)
-        prompt_tokens = []
-        for index, mlp in enumerate(self.speaker_prompt_mlps):
-            prompt = mlp(speaker.to(dtype=x.dtype)) + (
-                self.speaker_prompt[:, index, :].to(dtype=x.dtype)
-                * speaker_active
-            )
-            prompt_tokens.append(prompt.unsqueeze(1))
-        speaker_token = torch.cat(prompt_tokens, dim=1)
-        # condition_gate_scale=0 is the exact no-condition control used by
-        # semantic/speaker CFG diagnostics.
-        speaker_token = speaker_token * float(condition_gate_scale)
-        # Keep the speaker prompts as a fixed K/V prefix, independent of
-        # semantic duration and batch padding.  Their RoPE positions are
-        # negative; semantic frames retain positions 0..S-1.
-        semantic = torch.cat([speaker_token, semantic], dim=1)
-        prompt_mask = speaker_active.bool().expand(
-            -1, self.num_speaker_prompt_tokens
-        )
-        semantic_mask = torch.cat(
-            [
-                prompt_mask,
-                semantic_mask,
-            ],
-            dim=1,
-        )
+        semantic = torch.cat([timbre_tokens, semantic], dim=1)
+        semantic_mask = torch.cat([timbre_mask, semantic_mask], dim=1)
         target_positions = torch.arange(target_len, device=x.device)
-        # Keep semantic frame positions at 0..S-1; prompt tokens use negative
-        # prefix positions so adding four prompts does not shift every BNF
-        # frame by 320 ms in the RoPE coordinate system.
-        prompt_positions = torch.arange(
-            -self.num_speaker_prompt_tokens,
-            0,
-            device=x.device,
-            dtype=torch.long,
-        )
-        semantic_positions = torch.cat(
-            [prompt_positions, torch.arange(semantic_len, device=x.device)],
-            dim=0,
-        )
+        semantic_positions = torch.arange(semantic.shape[1], device=x.device)
         for layer in self.layers:
             x = layer(
                 x,
