@@ -650,9 +650,20 @@ def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
         for submodule in module.decoder.speaker_proj
         for parameter in submodule.parameters(recurse=False)
     ]
+    tte = module.decoder.timbre_memory
     return {
         "timbre_memory_grad_l2_rank_local_preclip": _gradient_l2(
-            list(module.decoder.timbre_memory.parameters())
+            list(tte.parameters())
+        ),
+        "timbre_query_grad_l2_rank_local_preclip": _gradient_l2([tte.query]),
+        "timbre_memory_up_grad_l2_rank_local_preclip": _gradient_l2(
+            list(tte.memory_up.parameters())
+        ),
+        "timbre_speaker_token_grad_l2_rank_local_preclip": _gradient_l2(
+            list(tte.speaker_token.parameters()) if tte.speaker_token is not None else []
+        ),
+        "timbre_encoder_grad_l2_rank_local_preclip": _gradient_l2(
+            list(tte.ref_encoder.parameters()) if tte.ref_encoder is not None else []
         ),
         "speaker_proj_grad_l2_rank_local_preclip": _gradient_l2(
             speaker_proj_parameters
