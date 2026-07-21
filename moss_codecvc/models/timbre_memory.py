@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -212,6 +213,15 @@ class ReferenceCodecTimbreMemory(nn.Module):
         self.speaker_embedding_dim = int(speaker_embedding_dim)
         self.speaker_conditioning = bool(speaker_conditioning and self.speaker_embedding_dim > 0)
         self.query = nn.Parameter(torch.empty(num_memory_tokens, adapter_dim))
+        position = torch.arange(num_memory_tokens, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, adapter_dim, 2, dtype=torch.float32)
+            * -(math.log(10000.0) / adapter_dim)
+        )
+        query_pos_embedding = torch.zeros(num_memory_tokens, adapter_dim)
+        query_pos_embedding[:, 0::2] = torch.sin(position * div_term)
+        query_pos_embedding[:, 1::2] = torch.cos(position * div_term[: query_pos_embedding[:, 1::2].shape[1]])
+        self.register_buffer("query_pos_embedding", query_pos_embedding)
         self.ref_norm = nn.LayerNorm(hidden_size)
         self.ref_down = nn.Linear(hidden_size, adapter_dim)
         self.ref_encoder: nn.Module | None
@@ -268,7 +278,7 @@ class ReferenceCodecTimbreMemory(nn.Module):
         self.memory_up = nn.Linear(adapter_dim, hidden_size)
         self.final_norm = nn.LayerNorm(hidden_size)
         self._last_attention_entropy_normalized = 0.0
-        nn.init.normal_(self.query, mean=0.0, std=0.02)
+        nn.init.normal_(self.query, mean=0.0, std=0.5)
 
     def forward(
         self,
@@ -313,7 +323,10 @@ class ReferenceCodecTimbreMemory(nn.Module):
                 ref_embeddings = _mask_padded(ref_embeddings, ref_mask)
             else:
                 ref_embeddings = self.ref_encoder(ref_embeddings, ref_mask)
-        query = self.query_norm(self.query).unsqueeze(0).expand(batch_size, -1, -1)
+        query_with_pos = self.query + self.query_pos_embedding.to(
+            device=self.query.device, dtype=self.query.dtype
+        )
+        query = self.query_norm(query_with_pos).unsqueeze(0).expand(batch_size, -1, -1)
         key_padding_mask = None
         if ref_mask is not None:
             key_padding_mask = ~ref_mask.bool()

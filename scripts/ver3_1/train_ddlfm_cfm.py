@@ -883,7 +883,21 @@ def main() -> int:
     args.zq_normalization_enabled = True
     zq_mean = zq_stats["mean"].to(device=device, dtype=torch.float32).view(1, 1, -1)
     zq_std = zq_stats["std"].to(device=device, dtype=torch.float32).view(1, 1, -1)
-    optimizer = torch.optim.AdamW(module.parameters(), lr=float(args.lr), betas=(0.9, 0.95), weight_decay=0.01)
+    query_parameter = raw_module.decoder.timbre_memory.query
+    query_parameter_ids = {id(query_parameter)}
+    query_parameters = [query_parameter]
+    other_parameters = [
+        parameter for parameter in module.parameters()
+        if id(parameter) not in query_parameter_ids
+    ]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": other_parameters, "lr": float(args.lr), "lr_multiplier": 1.0},
+            {"params": query_parameters, "lr": float(args.lr) * 10.0, "lr_multiplier": 10.0},
+        ],
+        betas=(0.9, 0.95),
+        weight_decay=0.01,
+    )
     ema = ExponentialMovingAverage(
         raw_module,
         float(args.ema_decay),
@@ -907,7 +921,7 @@ def main() -> int:
         gate_scale = float(args.gate_warmup_start) + (1.0 - float(args.gate_warmup_start)) * gate_progress
         current_lr = float(args.lr) * warmup_scale
         for group in optimizer.param_groups:
-            group["lr"] = current_lr
+            group["lr"] = current_lr * float(group.get("lr_multiplier", 1.0))
         optimizer.zero_grad(set_to_none=True)
         loss_total = 0.0
         cfm_loss_total = 0.0
