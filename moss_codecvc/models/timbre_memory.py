@@ -261,7 +261,9 @@ class ReferenceCodecTimbreMemory(nn.Module):
             if self.speaker_conditioning
             else None
         )
-        self.query_norm = nn.LayerNorm(adapter_dim)
+        # Do not normalize the learnable pooling queries: LayerNorm erased the
+        # magnitude signal needed to sharpen query/key attention scores.
+        self.query_scale = nn.Parameter(torch.ones(1) * 5.0)
         self.pool = nn.MultiheadAttention(
             embed_dim=adapter_dim,
             num_heads=num_heads,
@@ -278,6 +280,7 @@ class ReferenceCodecTimbreMemory(nn.Module):
         self.memory_up = nn.Linear(adapter_dim, hidden_size)
         self.final_norm = nn.LayerNorm(hidden_size)
         self._last_attention_entropy_normalized = 0.0
+        self._last_attn_max_minus_mean = 0.0
         nn.init.normal_(self.query, mean=0.0, std=0.5)
 
     def forward(
@@ -326,7 +329,7 @@ class ReferenceCodecTimbreMemory(nn.Module):
         query_with_pos = self.query + self.query_pos_embedding.to(
             device=self.query.device, dtype=self.query.dtype
         )
-        query = self.query_norm(query_with_pos).unsqueeze(0).expand(batch_size, -1, -1)
+        query = (query_with_pos * self.query_scale).unsqueeze(0).expand(batch_size, -1, -1)
         key_padding_mask = None
         if ref_mask is not None:
             key_padding_mask = ~ref_mask.bool()
@@ -344,6 +347,9 @@ class ReferenceCodecTimbreMemory(nn.Module):
             self._last_attention_entropy_normalized = float(
                 (entropy / torch.log(torch.tensor(float(ref_embeddings.shape[1]), device=entropy.device))).mean().item()
             )
+            max_attn = attention_weights.float().max(dim=-1).values
+            mean_attn = attention_weights.float().mean(dim=-1)
+            self._last_attn_max_minus_mean = float((max_attn - mean_attn).mean().item())
         memory = self.final_norm(self.memory_up(pooled + self.out(pooled)))
         return TimbreMemoryState(timbre_tokens=memory, timbre_mask=None)
 
