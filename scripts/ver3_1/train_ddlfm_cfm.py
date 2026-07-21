@@ -655,7 +655,9 @@ def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
         "timbre_memory_grad_l2_rank_local_preclip": _gradient_l2(
             list(tte.parameters())
         ),
-        "timbre_query_grad_l2_rank_local_preclip": _gradient_l2([tte.query]),
+        "timbre_query_generator_grad_l2_rank_local_preclip": _gradient_l2(
+            list(tte.query_generator.parameters())
+        ),
         "timbre_memory_up_grad_l2_rank_local_preclip": _gradient_l2(
             list(tte.memory_up.parameters())
         ),
@@ -672,6 +674,9 @@ def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
             getattr(tte, "_last_attn_max_minus_mean", 0.0)
         ),
         "timbre_query_scale_value": float(tte.query_scale.detach().float().item()),
+        "timbre_query_pairwise_cosine": float(
+            getattr(tte, "_last_query_pairwise_cosine", 1.0)
+        ),
         "speaker_adaln_grad_l2_rank_local_preclip": _gradient_l2(
             [
                 parameter
@@ -887,22 +892,22 @@ def main() -> int:
     args.zq_normalization_enabled = True
     zq_mean = zq_stats["mean"].to(device=device, dtype=torch.float32).view(1, 1, -1)
     zq_std = zq_stats["std"].to(device=device, dtype=torch.float32).view(1, 1, -1)
-    query_parameter = raw_module.decoder.timbre_memory.query
     query_scale_parameter = raw_module.decoder.timbre_memory.query_scale
-    query_parameter_ids = {id(query_parameter)}
+    query_generator_parameters = list(
+        raw_module.decoder.timbre_memory.query_generator.parameters()
+    )
+    query_generator_ids = {id(parameter) for parameter in query_generator_parameters}
     query_scale_ids = {id(query_scale_parameter)}
-    query_parameters = [query_parameter]
-    query_scale_parameters = [query_scale_parameter]
     other_parameters = [
         parameter for parameter in module.parameters()
-        if id(parameter) not in query_parameter_ids
+        if id(parameter) not in query_generator_ids
         and id(parameter) not in query_scale_ids
     ]
     optimizer = torch.optim.AdamW(
         [
             {"params": other_parameters, "lr": float(args.lr), "lr_multiplier": 1.0},
-            {"params": query_parameters, "lr": float(args.lr) * 10.0, "lr_multiplier": 10.0},
-            {"params": query_scale_parameters, "lr": float(args.lr), "lr_multiplier": 1.0},
+            {"params": query_generator_parameters, "lr": float(args.lr) * 5.0, "lr_multiplier": 5.0},
+            {"params": [query_scale_parameter], "lr": float(args.lr), "lr_multiplier": 1.0},
         ],
         betas=(0.9, 0.95),
         weight_decay=0.01,

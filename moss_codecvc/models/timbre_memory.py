@@ -212,7 +212,12 @@ class ReferenceCodecTimbreMemory(nn.Module):
         self.encoder_type = encoder_type
         self.speaker_embedding_dim = int(speaker_embedding_dim)
         self.speaker_conditioning = bool(speaker_conditioning and self.speaker_embedding_dim > 0)
-        self.query = nn.Parameter(torch.empty(num_memory_tokens, adapter_dim))
+        self.query_generator = nn.Sequential(
+            nn.LayerNorm(self.speaker_embedding_dim),
+            nn.Linear(self.speaker_embedding_dim, adapter_dim * 2),
+            nn.SiLU(),
+            nn.Linear(adapter_dim * 2, num_memory_tokens * adapter_dim),
+        )
         position = torch.arange(num_memory_tokens, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, adapter_dim, 2, dtype=torch.float32)
@@ -281,7 +286,7 @@ class ReferenceCodecTimbreMemory(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size)
         self._last_attention_entropy_normalized = 0.0
         self._last_attn_max_minus_mean = 0.0
-        nn.init.normal_(self.query, mean=0.0, std=0.5)
+        self._last_query_pairwise_cosine = 0.0
 
     def forward(
         self,
@@ -326,10 +331,25 @@ class ReferenceCodecTimbreMemory(nn.Module):
                 ref_embeddings = _mask_padded(ref_embeddings, ref_mask)
             else:
                 ref_embeddings = self.ref_encoder(ref_embeddings, ref_mask)
-        query_with_pos = self.query + self.query_pos_embedding.to(
-            device=self.query.device, dtype=self.query.dtype
-        )
-        query = (query_with_pos * self.query_scale).unsqueeze(0).expand(batch_size, -1, -1)
+        if speaker_embedding is None:
+            speaker_embedding = torch.zeros(
+                batch_size,
+                self.speaker_embedding_dim,
+                device=ref_embeddings.device,
+                dtype=ref_embeddings.dtype,
+            )
+        elif speaker_embedding.shape != (batch_size, self.speaker_embedding_dim):
+            raise ValueError(
+                f"speaker_embedding must be [B, {self.speaker_embedding_dim}], "
+                f"got {tuple(speaker_embedding.shape)}"
+            )
+        query_generated = self.query_generator(
+            speaker_embedding.to(ref_embeddings.device, dtype=ref_embeddings.dtype)
+        ).view(batch_size, self.num_memory_tokens, self.adapter_dim)
+        query_with_pos = query_generated + self.query_pos_embedding.to(
+            device=query_generated.device, dtype=query_generated.dtype
+        ).unsqueeze(0)
+        query = query_with_pos * self.query_scale
         key_padding_mask = None
         if ref_mask is not None:
             key_padding_mask = ~ref_mask.bool()
@@ -350,6 +370,12 @@ class ReferenceCodecTimbreMemory(nn.Module):
             max_attn = attention_weights.float().max(dim=-1).values
             mean_attn = attention_weights.float().mean(dim=-1)
             self._last_attn_max_minus_mean = float((max_attn - mean_attn).mean().item())
+            q = F.normalize(query.float(), dim=-1)
+            pairwise = q @ q.transpose(-1, -2)
+            off_mask = ~torch.eye(
+                self.num_memory_tokens, device=q.device, dtype=torch.bool
+            ).unsqueeze(0).expand(batch_size, -1, -1)
+            self._last_query_pairwise_cosine = float(pairwise[off_mask].mean().item())
         memory = self.final_norm(self.memory_up(pooled + self.out(pooled)))
         return TimbreMemoryState(timbre_tokens=memory, timbre_mask=None)
 
