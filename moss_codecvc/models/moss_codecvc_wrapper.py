@@ -223,6 +223,57 @@ SOURCE_MEMORY_TYPE_IDS = {
 SPEAKER_SIDE_DECODER_BLOCK_COUNT = 32
 
 
+def load_content_encoder_state_with_probe_migration(
+    module: nn.Module,
+    checkpoint_state: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Load a baseline content encoder into a wider Probe-C encoder safely.
+
+    Probe C adds Conformer layers 2 and 3.  Only those new layer keys may be
+    absent; all other missing/unexpected/shape-mismatched keys are errors.
+    """
+    current_state = module.state_dict()
+    current_keys = set(current_state)
+    checkpoint_keys = set(checkpoint_state)
+    unexpected_keys = sorted(checkpoint_keys - current_keys)
+    if unexpected_keys:
+        raise RuntimeError(
+            "content_cross_attn_encoder checkpoint has unexpected keys: "
+            + ", ".join(unexpected_keys[:12])
+        )
+    missing_keys = sorted(current_keys - checkpoint_keys)
+    allowed_missing = [
+        key for key in missing_keys
+        if key.startswith("layers.2.") or key.startswith("layers.3.")
+    ]
+    disallowed_missing = sorted(set(missing_keys) - set(allowed_missing))
+    if disallowed_missing:
+        raise RuntimeError(
+            "content_cross_attn_encoder checkpoint is missing non-migration keys: "
+            + ", ".join(disallowed_missing[:12])
+        )
+    for key, value in checkpoint_state.items():
+        if tuple(value.shape) != tuple(current_state[key].shape):
+            raise RuntimeError(
+                "content_cross_attn_encoder shape mismatch for "
+                f"{key}: checkpoint={tuple(value.shape)} model={tuple(current_state[key].shape)}"
+            )
+    load_result = module.load_state_dict(checkpoint_state, strict=False)
+    if load_result.unexpected_keys:
+        raise RuntimeError(
+            "content_cross_attn_encoder unexpected keys after load: "
+            + ", ".join(load_result.unexpected_keys[:12])
+        )
+    return {
+        "loaded_keys": len(checkpoint_keys),
+        "missing_keys": missing_keys,
+        "initialized_new_layers": sorted(
+            {key.split(".", 2)[1] for key in allowed_missing}
+        ),
+        "unexpected_keys": list(load_result.unexpected_keys),
+    }
+
+
 def normalize_source_content_memory_type(value: str | None) -> str:
     memory_type = str(value or "hubert_continuous").strip().lower()
     aliases = {
@@ -4946,7 +4997,14 @@ class MossCodecVCTimbreMemoryWrapper(nn.Module):
         if wrapper.source_semantic_layer_adapters is not None and state.get("source_semantic_layer_adapters") is not None:
             wrapper.source_semantic_layer_adapters.load_state_dict(state["source_semantic_layer_adapters"])
         if wrapper.content_cross_attn_encoder is not None and state.get("content_cross_attn_encoder") is not None:
-            wrapper.content_cross_attn_encoder.load_state_dict(state["content_cross_attn_encoder"])
+            # Probe-C may widen the BNF content encoder from the baseline two
+            # Conformer layers to four.  Preserve the trained prefix and
+            # initialize only the newly-added layers; do not use a blanket
+            # strict=False load which could hide unrelated checkpoint drift.
+            wrapper._content_encoder_migration = load_content_encoder_state_with_probe_migration(
+                wrapper.content_cross_attn_encoder,
+                state["content_cross_attn_encoder"],
+            )
         if wrapper.content_cross_attn_layers is not None and state.get("content_cross_attn_layers") is not None:
             wrapper.content_cross_attn_layers.load_state_dict(state["content_cross_attn_layers"])
         if wrapper.content_phoneme_classifier is not None and state.get("content_phoneme_classifier") is not None:
