@@ -662,6 +662,13 @@ def speaker_gradient_diagnostics(module: DDLFMTrainModule) -> dict[str, float]:
                 for parameter in layer.speaker_adaln.parameters()
             ]
         ),
+        "speaker_film_grad_l2_rank_local_preclip": _gradient_l2(
+            [
+                parameter
+                for layer in module.decoder.layers
+                for parameter in layer.speaker_film_generator.parameters()
+            ]
+        ),
         "speaker_proj_grad_l2_rank_local_preclip": _gradient_l2(
             speaker_proj_parameters
         ),
@@ -944,7 +951,12 @@ def main() -> int:
                 batch["speaker"],
                 float(args.speaker_dropout),
             )
-            prompt_input = batch["prompt_zq"].to(device=device)
+            # Batch-53 uses decoder-domain prompt zq directly as semantic K/V.
+            # Put it in the same normalized space as the CFM target before
+            # concatenation; raw zq has strongly anisotropic channel scales.
+            prompt_input = (
+                batch["prompt_zq"].to(device=device) - zq_mean
+            ) / zq_std
             if bool(speaker_drop_mask.any().item()):
                 prompt_input = prompt_input.clone()
                 prompt_input[speaker_drop_mask] = 0.0
@@ -996,7 +1008,9 @@ def main() -> int:
                         target_mask=batch["target_mask"],
                         semantic_mask=full_semantic_mask,
                         semantic_modality=batch["mode"],
-                        prompt_zq=batch["prompt_zq"].to(device=device),
+                        prompt_zq=(
+                            batch["prompt_zq"].to(device=device) - zq_mean
+                        ) / zq_std,
                         prompt_mask=batch["prompt_mask"].to(device=device),
                         condition_gate_scale=gate_scale,
                     ).velocity

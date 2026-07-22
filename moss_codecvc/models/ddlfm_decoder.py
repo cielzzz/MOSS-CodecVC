@@ -117,6 +117,7 @@ class DDLFMAdaLNBlock(nn.Module):
         num_heads: int,
         ffn_size: int,
         condition_size: int,
+        speaker_dim: int | None = None,
         dropout: float = 0.0,
         rope_base: float = 10000.0,
         cross_gate_init: float = 0.0,
@@ -186,6 +187,13 @@ class DDLFMAdaLNBlock(nn.Module):
         )
         nn.init.normal_(self.speaker_adaln[-1].weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.speaker_adaln[-1].bias)
+        speaker_dim = int(condition_size if speaker_dim is None else speaker_dim)
+        self.speaker_film_generator = nn.Sequential(
+            nn.LayerNorm(speaker_dim),
+            nn.Linear(speaker_dim, hidden_size * 2),
+        )
+        nn.init.zeros_(self.speaker_film_generator[-1].weight)
+        nn.init.zeros_(self.speaker_film_generator[-1].bias)
 
     def _cross_attention_with_rope(
         self,
@@ -257,7 +265,9 @@ class DDLFMAdaLNBlock(nn.Module):
         semantic_positions: torch.Tensor | None = None,
         condition_gate_scale: float = 1.0,
         speaker_condition: torch.Tensor | None = None,
+        speaker_embedding: torch.Tensor | None = None,
         speaker_condition_scale: float = 1.0,
+        enable_speaker_film: bool = True,
     ) -> torch.Tensor:
         gate_scale = float(condition_gate_scale)
         if not math.isfinite(gate_scale) or gate_scale < 0.0:
@@ -299,6 +309,19 @@ class DDLFMAdaLNBlock(nn.Module):
             need_weights=False,
         )[0]
         x = x + (1.0 + gate_self).unsqueeze(1) * h
+
+        # Batch-53 Path 4: speaker-only FiLM between self-attention and
+        # semantic cross-attention.  Subtracting the zero-speaker baseline
+        # makes classifier-free speaker dropout exactly identity even after
+        # LayerNorm affine parameters and the Linear bias have trained.
+        if enable_speaker_film and speaker_embedding is not None:
+            if speaker_embedding.ndim != 2 or int(speaker_embedding.shape[0]) != int(x.shape[0]):
+                raise ValueError("speaker_embedding must be [B,D]")
+            zero_speaker = torch.zeros_like(speaker_embedding)
+            gamma_beta = self.speaker_film_generator(speaker_embedding)
+            gamma_beta = gamma_beta - self.speaker_film_generator(zero_speaker)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            x = x * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
 
         h = _modulate(self.norm_cross(x), shift_cross, scale_cross)
         if target_positions is None:
@@ -399,6 +422,7 @@ class DDLFMDecoder(nn.Module):
                     int(num_heads),
                     int(ffn_size),
                     self.hidden_size,
+                    speaker_dim=self.speaker_dim,
                     dropout=float(dropout),
                     rope_base=float(rope_base),
                     cross_gate_init=float(cross_gate_init),
@@ -516,6 +540,9 @@ class DDLFMDecoder(nn.Module):
         semantic_mask: torch.Tensor | None = None,
         semantic_modality: torch.Tensor | None = None,
         condition_gate_scale: float = 1.0,
+        enable_speaker_broadcast: bool = True,
+        enable_prompt_prefix: bool = True,
+        enable_speaker_film: bool = True,
     ) -> DDLFMOutput:
         if x_t.ndim != 3 or int(x_t.shape[-1]) != self.latent_dim:
             raise ValueError(f"x_t must be [B,T,{self.latent_dim}], got {tuple(x_t.shape)}")
@@ -552,7 +579,12 @@ class DDLFMDecoder(nn.Module):
 
         pos = _sinusoidal_time_embedding(t, self.hidden_size).to(dtype=x_t.dtype)
         time_condition = self.time_proj(pos)
-        speaker_condition = self.speaker_proj(speaker.to(dtype=x_t.dtype))
+        speaker_value = speaker.to(dtype=x_t.dtype)
+        zero_speaker = torch.zeros_like(speaker_value)
+        # Center all speaker-derived paths around their zero-input response.
+        # This keeps the classifier-free speaker branch exactly unconditional
+        # after affine biases have learned nonzero values.
+        speaker_condition = self.speaker_proj(speaker_value) - self.speaker_proj(zero_speaker)
         condition = time_condition + speaker_condition
         x = self.input_proj(x_t)
         x = x + float(condition_gate_scale) * self.speaker_input_scale * self.speaker_input_proj(
@@ -568,10 +600,41 @@ class DDLFMDecoder(nn.Module):
         semantic = semantic.to(dtype=x.dtype)
         semantic = semantic + self.modality_embedding(semantic_modality).unsqueeze(1).to(dtype=x.dtype)
         semantic = self.semantic_proj(semantic).masked_fill(~semantic_mask.unsqueeze(-1), 0.0)
-        speaker_prefix = self.speaker_expand(speaker.to(dtype=x.dtype)).unsqueeze(1)
-        semantic = torch.cat([speaker_prefix, semantic], dim=1)
-        speaker_prefix_mask = torch.ones(batch, 1, dtype=torch.bool, device=x.device)
-        semantic_mask = torch.cat([speaker_prefix_mask, semantic_mask], dim=1)
+        # Batch-53 Path 2: broadcast the speaker projection into every valid
+        # semantic frame instead of making one token compete with the full
+        # semantic sequence.
+        if enable_speaker_broadcast:
+            speaker_broadcast = (
+                self.speaker_expand(speaker_value) - self.speaker_expand(zero_speaker)
+            ).unsqueeze(1)
+            semantic = semantic + speaker_broadcast
+            semantic = semantic.masked_fill(~semantic_mask.unsqueeze(-1), 0.0)
+
+        # Batch-53 Path 3: same-speaker decoder-domain zq occupies a full
+        # 64-frame prefix.  Masked prompt rows remain present but cannot be
+        # attended, which gives speaker CFG one shape-stable unconditional
+        # branch.
+        if enable_prompt_prefix and prompt_zq is not None:
+            if prompt_zq.ndim != 3 or int(prompt_zq.shape[0]) != batch:
+                raise ValueError("prompt_zq must be [B,K,H]")
+            if int(prompt_zq.shape[-1]) != self.hidden_size:
+                raise ValueError(
+                    f"prompt_zq last dim must equal hidden_size={self.hidden_size}, "
+                    f"got {int(prompt_zq.shape[-1])}"
+                )
+            prompt_len = int(prompt_zq.shape[1])
+            if prompt_mask is None:
+                prompt_mask = torch.ones(
+                    batch, prompt_len, dtype=torch.bool, device=x.device
+                )
+            else:
+                prompt_mask = prompt_mask.to(device=x.device).bool()
+                if tuple(prompt_mask.shape) != (batch, prompt_len):
+                    raise ValueError("prompt_mask must be [B,K] matching prompt_zq")
+            prompt_prefix = prompt_zq.to(device=x.device, dtype=x.dtype)
+            prompt_prefix = prompt_prefix.masked_fill(~prompt_mask.unsqueeze(-1), 0.0)
+            semantic = torch.cat([prompt_prefix, semantic], dim=1)
+            semantic_mask = torch.cat([prompt_mask, semantic_mask], dim=1)
         target_positions = torch.arange(target_len, device=x.device)
         semantic_positions = torch.arange(semantic.shape[1], device=x.device)
         for layer in self.layers:
@@ -585,7 +648,9 @@ class DDLFMDecoder(nn.Module):
                 semantic_positions=semantic_positions,
                 condition_gate_scale=condition_gate_scale,
                 speaker_condition=speaker_condition,
+                speaker_embedding=speaker_value,
                 speaker_condition_scale=self.speaker_condition_scale,
+                enable_speaker_film=enable_speaker_film,
             )
         velocity = self.output_proj(self.output_norm(x)).masked_fill(~target_mask.unsqueeze(-1), 0.0)
         return DDLFMOutput(velocity=velocity)
